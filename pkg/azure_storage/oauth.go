@@ -2,21 +2,30 @@ package azure_storage
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/dariopb/azure-storage/pkg/azure_storage/internal/oauth"
+	"github.com/dariopb/blober/pkg/azure_storage/internal/oauth"
+	qrterminal "github.com/mdp/qrterminal/v3"
 )
 
 var identityBaseURL = "https://login.microsoftonline.com"
+var openBrowserFunc = openBrowser
+var authOutput io.Writer = os.Stderr
 
 func Login(ctx context.Context, cfg Config) (azcore.TokenCredential, error) {
 	cfg = cfg.Normalize()
@@ -30,26 +39,124 @@ func Login(ctx context.Context, cfg Config) (azcore.TokenCredential, error) {
 		}
 	} else if ok {
 		if isTokenUsable(cached, time.Now()) {
-			return credentialFromCachedToken(cached), nil
+			return newRefreshableTokenCredential(ctx, cfg, http.DefaultClient, cached), nil
 		}
 		if cached.RefreshToken != "" {
 			if refreshed, err := refreshCachedToken(ctx, http.DefaultClient, cfg, cached.RefreshToken); err == nil {
 				if err := saveCachedToken(cfg.TokenFile, refreshed); err != nil {
 					return nil, err
 				}
-				return credentialFromCachedToken(refreshed), nil
+				return newRefreshableTokenCredential(ctx, cfg, http.DefaultClient, refreshed), nil
 			}
 		}
 	}
 
-	token, err := runDeviceFlow(ctx, http.DefaultClient, cfg)
+	var token CachedToken
+	var err error
+	if cfg.UserFlow {
+		token, err = runBrowserFlow(ctx, http.DefaultClient, cfg)
+	} else {
+		token, err = runDeviceFlow(ctx, http.DefaultClient, cfg)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if err := saveCachedToken(cfg.TokenFile, token); err != nil {
 		return nil, err
 	}
-	return credentialFromCachedToken(token), nil
+	return newRefreshableTokenCredential(ctx, cfg, http.DefaultClient, token), nil
+}
+
+func runBrowserFlow(ctx context.Context, client *http.Client, cfg Config) (CachedToken, error) {
+	verifier, err := randomURLToken(32)
+	if err != nil {
+		return CachedToken{}, err
+	}
+	state, err := randomURLToken(24)
+	if err != nil {
+		return CachedToken{}, err
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return CachedToken{}, err
+	}
+	defer listener.Close()
+
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		return CachedToken{}, err
+	}
+	redirectURI := "http://localhost:" + port
+	callbackCh := make(chan browserCallback, 1)
+	server := browserCallbackServer(state, callbackCh)
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	defer server.Shutdown(context.Background())
+
+	authURL := authorizationURL(cfg, redirectURI, state, pkceChallenge(verifier))
+	fmt.Fprintf(authOutput, "Listening for OAuth redirect at %s\n", redirectURI)
+	fmt.Fprintf(authOutput, "Opening browser for login: %s\n", authURL)
+	if err := openBrowserFunc(authURL); err != nil {
+		return CachedToken{}, err
+	}
+
+	var callback browserCallback
+	select {
+	case <-ctx.Done():
+		return CachedToken{}, ctx.Err()
+	case callback = <-callbackCh:
+	}
+	if callback.err != nil {
+		return CachedToken{}, callback.err
+	}
+
+	values := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {cfg.ClientID},
+		"scope":         {cfg.Scope},
+		"code":          {callback.code},
+		"redirect_uri":  {redirectURI},
+		"code_verifier": {verifier},
+	}
+	body, err := postForm(ctx, client, tokenURL(cfg.TenantID), values)
+	if err != nil {
+		return CachedToken{}, err
+	}
+	return cachedTokenFromResponse(body, cfg, "")
+}
+
+type browserCallback struct {
+	code string
+	err  error
+}
+
+func browserCallbackServer(wantState string, callbackCh chan<- browserCallback) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		var result browserCallback
+		switch {
+		case query.Get("error") != "":
+			result.err = fmt.Errorf("browser login failed: %s", query.Get("error"))
+		case query.Get("state") != wantState:
+			result.err = errors.New("browser login returned invalid state")
+		case query.Get("code") == "":
+			result.err = errors.New("browser login did not return an authorization code")
+		default:
+			result.code = query.Get("code")
+		}
+		if result.err != nil {
+			http.Error(w, result.err.Error(), http.StatusBadRequest)
+		} else {
+			fmt.Fprintln(w, "Authentication complete. You can close this browser tab.")
+		}
+		select {
+		case callbackCh <- result:
+		default:
+		}
+	})
+	return &http.Server{Handler: mux}
 }
 
 func refreshCachedToken(ctx context.Context, client *http.Client, cfg Config, refreshToken string) (CachedToken, error) {
@@ -71,12 +178,43 @@ func runDeviceFlow(ctx context.Context, client *http.Client, cfg Config) (Cached
 	if err != nil {
 		return CachedToken{}, err
 	}
-	if device.Message != "" {
-		fmt.Fprintln(os.Stderr, device.Message)
-	} else {
-		fmt.Fprintf(os.Stderr, "Open %s and enter code %s\n", device.VerificationURI, device.UserCode)
-	}
+	writeDeviceFlowInstructions(os.Stderr, device)
 	return pollDeviceCode(ctx, client, cfg, device)
+}
+
+func writeDeviceFlowInstructions(w io.Writer, device oauth.DeviceCodeResponse) {
+	authURL := deviceAuthURL(device)
+	if device.Message != "" {
+		fmt.Fprintln(w, device.Message)
+	} else {
+		fmt.Fprintf(w, "Open %s and enter code %s\n", device.VerificationURI, device.UserCode)
+	}
+	if authURL == "" {
+		return
+	}
+	if device.VerificationURIComplete != "" {
+		fmt.Fprintf(w, "Or scan this QR code to open %s\n", authURL)
+	} else {
+		fmt.Fprintf(w, "Or scan this QR code to open %s, then enter code %s\n", authURL, device.UserCode)
+	}
+	fmt.Fprintln(w)
+	qrterminal.GenerateWithConfig(authURL, qrterminal.Config{
+		Level:          qrterminal.L,
+		Writer:         w,
+		HalfBlocks:     true,
+		BlackChar:      qrterminal.BLACK_BLACK,
+		WhiteBlackChar: qrterminal.WHITE_BLACK,
+		WhiteChar:      qrterminal.WHITE_WHITE,
+		BlackWhiteChar: qrterminal.BLACK_WHITE,
+		QuietZone:      1,
+	})
+}
+
+func deviceAuthURL(device oauth.DeviceCodeResponse) string {
+	if device.VerificationURIComplete != "" {
+		return device.VerificationURIComplete
+	}
+	return device.VerificationURI
 }
 
 func requestDeviceCode(ctx context.Context, client *http.Client, cfg Config) (oauth.DeviceCodeResponse, error) {
@@ -190,6 +328,64 @@ func postForm(ctx context.Context, client *http.Client, endpoint string, values 
 		return nil, fmt.Errorf("identity endpoint returned HTTP %d", resp.StatusCode)
 	}
 	return nil, oauthErr
+}
+
+func authorizationURL(cfg Config, redirectURI, state, codeChallenge string) string {
+	values := url.Values{
+		"client_id":             {cfg.ClientID},
+		"response_type":         {"code"},
+		"redirect_uri":          {redirectURI},
+		"response_mode":         {"query"},
+		"scope":                 {cfg.Scope},
+		"state":                 {state},
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
+		"prompt":                {"select_account"},
+	}
+	return strings.TrimRight(identityBaseURL, "/") + "/" + url.PathEscape(cfg.TenantID) + "/oauth2/v2.0/authorize?" + values.Encode()
+}
+
+func pkceChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func randomURLToken(byteCount int) (string, error) {
+	buf := make([]byte, byteCount)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func openBrowser(target string) error {
+	if browser := strings.TrimSpace(os.Getenv("BROWSER")); browser != "" {
+		parts := strings.Fields(browser)
+		if len(parts) == 0 {
+			return errors.New("BROWSER is empty")
+		}
+		fmt.Fprintf(authOutput, "Invoking BROWSER command: %s\n", browser)
+		cmd := exec.Command(parts[0], append(parts[1:], target)...)
+		cmd.Stdout = authOutput
+		cmd.Stderr = authOutput
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		go func() {
+			_ = cmd.Wait()
+		}()
+		return nil
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", target)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", target)
+	default:
+		cmd = exec.Command("xdg-open", target)
+	}
+	return cmd.Start()
 }
 
 func deviceCodeURL(tenant string) string {

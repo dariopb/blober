@@ -23,6 +23,7 @@ type Config struct {
 	AccountName    string
 	TokenFile      string
 	Scope          string
+	UserFlow       bool
 }
 
 func (c Config) Normalize() Config {

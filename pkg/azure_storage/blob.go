@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -21,12 +23,46 @@ type BlobInfo struct {
 	LastModified time.Time
 }
 
+type BlobEntry struct {
+	Name         string
+	Key          string
+	Prefix       string
+	IsDir        bool
+	Size         int64
+	LastModified time.Time
+}
+
+type ContainerInfo struct {
+	Name string
+}
+
 func NewBlobServiceClient(cred azcore.TokenCredential, cfg Config) (*azblob.Client, error) {
 	cfg = cfg.Normalize()
 	if err := cfg.ValidateBase(); err != nil {
 		return nil, err
 	}
 	return azblob.NewClient(fmt.Sprintf("https://%s.blob.core.windows.net/", cfg.AccountName), cred, nil)
+}
+
+func ListContainers(ctx context.Context, c *azblob.Client) ([]ContainerInfo, error) {
+	pager := c.NewListContainersPager(nil)
+	var containers []ContainerInfo
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range page.ContainerItems {
+			if item == nil || item.Name == nil {
+				continue
+			}
+			containers = append(containers, ContainerInfo{Name: *item.Name})
+		}
+	}
+	sort.Slice(containers, func(i, j int) bool {
+		return containers[i].Name < containers[j].Name
+	})
+	return containers, nil
 }
 
 func ListBlobs(ctx context.Context, c *azblob.Client, container, prefix string) ([]BlobInfo, error) {
@@ -69,6 +105,44 @@ func ListBlobs(ctx context.Context, c *azblob.Client, container, prefix string) 
 	return blobs, nil
 }
 
+func ListBlobEntries(ctx context.Context, c *azblob.Client, container, prefix string) ([]BlobEntry, error) {
+	blobs, err := ListBlobs(ctx, c, container, prefix)
+	if err != nil {
+		return nil, err
+	}
+	dirs := make(map[string]BlobEntry)
+	var entries []BlobEntry
+	for _, blob := range blobs {
+		rest := strings.TrimPrefix(blob.Key, prefix)
+		if rest == "" {
+			continue
+		}
+		if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+			name := rest[:slash+1]
+			dirPrefix := JoinBlobPrefix(prefix, strings.TrimSuffix(name, "/")) + "/"
+			dirs[dirPrefix] = BlobEntry{Name: name, Prefix: dirPrefix, IsDir: true}
+			continue
+		}
+		entries = append(entries, BlobEntry{
+			Name:         rest,
+			Key:          blob.Key,
+			IsDir:        false,
+			Size:         blob.Size,
+			LastModified: blob.LastModified,
+		})
+	}
+	for _, dir := range dirs {
+		entries = append(entries, dir)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IsDir != entries[j].IsDir {
+			return entries[i].IsDir
+		}
+		return entries[i].Name < entries[j].Name
+	})
+	return entries, nil
+}
+
 func WriteBlobList(out io.Writer, blobs []BlobInfo) error {
 	keyWidth := len("KEY")
 	sizeWidth := len("BYTES")
@@ -91,6 +165,29 @@ func WriteBlobList(out io.Writer, blobs []BlobInfo) error {
 		}
 	}
 	return nil
+}
+
+func JoinBlobPrefix(prefix, name string) string {
+	prefix = strings.TrimPrefix(prefix, "/")
+	name = strings.Trim(name, "/")
+	if prefix == "" {
+		return name
+	}
+	if name == "" {
+		return strings.TrimSuffix(prefix, "/")
+	}
+	return strings.TrimSuffix(prefix, "/") + "/" + name
+}
+
+func BlobBaseName(key string) string {
+	return pathBase(strings.TrimSuffix(key, "/"))
+}
+
+func pathBase(path string) string {
+	if slash := strings.LastIndexByte(path, '/'); slash >= 0 {
+		return path[slash+1:]
+	}
+	return path
 }
 
 func humanSize(size int64) string {

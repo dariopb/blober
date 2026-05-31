@@ -1,0 +1,11 @@
+{
+  "background": "#626262",
+  "highlight": "#C200FF",
+  "text": "#D0D0D0",
+  "header_text": "#000000",
+  "selected": "#FF00FF",
+  "error": "#FF0000",
+  "modal_border": "#111111",
+  "modal_background": "#D0D0D0",
+  "modal_shadow": "#000000"
+}

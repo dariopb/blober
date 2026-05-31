@@ -56,6 +56,66 @@ func TestBlobDownloadRefusesOverwriteBeforeAuth(t *testing.T) {
 	}
 }
 
+func TestTUIValidatesLocalPathBeforeAuth(t *testing.T) {
+	cmd := newCommand()
+
+	err := cmd.Run(context.Background(), []string{
+		"blober",
+		"--subscription", "00000000-0000-0000-0000-000000000000",
+		"--account", "acct123",
+		"tui",
+		"--container", "data",
+		"--local-path", "/definitely/not/here",
+	})
+	if err == nil {
+		t.Fatal("expected missing local path error")
+	}
+	if !strings.Contains(err.Error(), "not/here") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestTUIValidatesThemeFileBeforeAuth(t *testing.T) {
+	tmp := t.TempDir()
+	cmd := newCommand()
+
+	err := cmd.Run(context.Background(), []string{
+		"blober",
+		"--subscription", "00000000-0000-0000-0000-000000000000",
+		"--account", "acct123",
+		"tui",
+		"--container", "data",
+		"--local-path", tmp,
+		"--theme-file", tmp + "/missing.json",
+	})
+	if err == nil {
+		t.Fatal("expected missing theme file error")
+	}
+	if !strings.Contains(err.Error(), "missing.json") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestTUIPrefixRequiresContainerBeforeAuth(t *testing.T) {
+	tmp := t.TempDir()
+	cmd := newCommand()
+
+	err := cmd.Run(context.Background(), []string{
+		"blober",
+		"--subscription", "00000000-0000-0000-0000-000000000000",
+		"--account", "acct123",
+		"tui",
+		"--local-path", tmp,
+		"--prefix", "logs/",
+	})
+	if err == nil {
+		t.Fatal("expected prefix/container validation error")
+	}
+	if !strings.Contains(err.Error(), "--prefix requires --container") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestFormatTransferProgress(t *testing.T) {
 	if got, want := formatTransferProgress("upload", 25, 100, time.Second), "\rupload 25/100 bytes (25.0%) 0.00 MB/s"; got != want {
 		t.Fatalf("progress output = %q, want %q", got, want)

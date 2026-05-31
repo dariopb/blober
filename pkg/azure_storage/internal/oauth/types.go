@@ -3,12 +3,13 @@ package oauth
 import "strings"
 
 type DeviceCodeResponse struct {
-	UserCode        string `json:"user_code"`
-	DeviceCode      string `json:"device_code"`
-	VerificationURI string `json:"verification_uri"`
-	ExpiresIn       int    `json:"expires_in"`
-	Interval        int    `json:"interval"`
-	Message         string `json:"message"`
+	UserCode                string `json:"user_code"`
+	DeviceCode              string `json:"device_code"`
+	VerificationURI         string `json:"verification_uri"`
+	VerificationURIComplete string `json:"verification_uri_complete"`
+	ExpiresIn               int    `json:"expires_in"`
+	Interval                int    `json:"interval"`
+	Message                 string `json:"message"`
 }
 
 type TokenResponse struct {

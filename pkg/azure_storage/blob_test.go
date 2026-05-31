@@ -39,7 +39,20 @@ func TestWriteBlobListAligned(t *testing.T) {
 			t.Fatalf("output missing %q:\n%s", want, got)
 		}
 	}
+
 	if !strings.Contains(got, "meru-logo.png     861117  840.9 KB") {
 		t.Fatalf("output not aligned as expected:\n%s", got)
+	}
+}
+
+func TestBlobPathHelpers(t *testing.T) {
+	if got, want := JoinBlobPrefix("logs/2026/", "app.log"), "logs/2026/app.log"; got != want {
+		t.Fatalf("JoinBlobPrefix() = %q, want %q", got, want)
+	}
+	if got, want := JoinBlobPrefix("", "app.log"), "app.log"; got != want {
+		t.Fatalf("JoinBlobPrefix empty prefix = %q, want %q", got, want)
+	}
+	if got, want := BlobBaseName("logs/2026/app.log"), "app.log"; got != want {
+		t.Fatalf("BlobBaseName() = %q, want %q", got, want)
 	}
 }

@@ -1,2 +1,19 @@
+# Token cache (contains access/refresh tokens — never commit)
 azure_storage_token.json
+
+# Build artifacts
 /blober
+/blober.exe
+
+# Editor / OS junk
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Go
+*.test
+*.out
+coverage.txt

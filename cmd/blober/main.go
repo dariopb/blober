@@ -7,7 +7,9 @@ import (
 	"os"
 	"time"
 
-	azure_storage "github.com/dariopb/azure-storage/pkg/azure_storage"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/dariopb/blober/cmd/blober/tui"
+	azure_storage "github.com/dariopb/blober/pkg/azure_storage"
 	"github.com/urfave/cli/v3"
 )
 
@@ -21,17 +23,19 @@ func main() {
 func newCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "blober",
-		Usage: "authenticate to Azure Storage and list, upload, or download blobs",
+		Usage: "authenticate to Azure Storage and list, upload, download, or browse blobs",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "subscription", Usage: "Azure subscription ID", Sources: cli.EnvVars("AZURE_SUBSCRIPTION_ID"), Required: true},
 			&cli.StringFlag{Name: "account", Usage: "Azure Storage account name", Sources: cli.EnvVars("AZURE_STORAGE_ACCOUNT"), Required: true},
 			&cli.StringFlag{Name: "tenant", Usage: "Microsoft Entra tenant ID", Sources: cli.EnvVars("AZURE_TENANT_ID")},
 			&cli.StringFlag{Name: "client-id", Usage: "OAuth client ID", Sources: cli.EnvVars("AZURE_CLIENT_ID")},
 			&cli.StringFlag{Name: "token-file", Usage: "token cache path", Sources: cli.EnvVars("AZURE_STORAGE_TOKEN_FILE")},
+			&cli.BoolFlag{Name: "user-flow", Usage: "authenticate with browser-based OAuth user flow instead of device code when login is required"},
 			&cli.BoolFlag{Name: "verbose", Usage: "enable verbose logging"},
 		},
 		Commands: []*cli.Command{
 			blobCommand(),
+			tuiCommand(),
 		},
 	}
 }
@@ -166,6 +170,65 @@ func blobDownloadCommand() *cli.Command {
 	}
 }
 
+func tuiCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "tui",
+		Usage: "browse and copy blobs in a two-pane terminal UI",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "container", Usage: "container name"},
+			&cli.StringFlag{Name: "prefix", Usage: "initial blob key prefix"},
+			&cli.StringFlag{Name: "local-path", Usage: "initial local directory", TakesFile: true, Value: "."},
+			&cli.StringFlag{Name: "theme-file", Usage: "JSON theme file"},
+			&cli.BoolFlag{Name: "force", Usage: "overwrite destination files during copy"},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			container := cmd.String("container")
+			prefix := cmd.String("prefix")
+			localPath := cmd.String("local-path")
+			if container != "" {
+				if err := azure_storage.ValidateContainerName(container); err != nil {
+					return err
+				}
+			}
+			if container == "" && prefix != "" {
+				return fmt.Errorf("--prefix requires --container")
+			}
+			if err := azure_storage.ValidateBlobPrefix(prefix); err != nil {
+				return err
+			}
+			if stat, err := os.Stat(localPath); err != nil {
+				return err
+			} else if !stat.IsDir() {
+				return fmt.Errorf("local path is not a directory: %s", localPath)
+			}
+			theme, err := tui.LoadThemeFile(cmd.String("theme-file"))
+			if err != nil {
+				return err
+			}
+			cfg := buildConfig(cmd)
+			cred, err := azure_storage.Login(ctx, cfg)
+			if err != nil {
+				return err
+			}
+			client, err := azure_storage.NewBlobServiceClient(cred, cfg)
+			if err != nil {
+				return err
+			}
+			model := tui.New(tui.Config{
+				Client:      client,
+				AccountName: cfg.AccountName,
+				Container:   container,
+				Prefix:      prefix,
+				LocalPath:   localPath,
+				Force:       cmd.Bool("force"),
+				Theme:       theme,
+			})
+			_, err = tea.NewProgram(model, tea.WithAltScreen()).Run()
+			return err
+		},
+	}
+}
+
 func buildConfig(cmd *cli.Command) azure_storage.Config {
 	return azure_storage.Config{
 		SubscriptionID: cmd.String("subscription"),
@@ -173,6 +236,7 @@ func buildConfig(cmd *cli.Command) azure_storage.Config {
 		TenantID:       cmd.String("tenant"),
 		ClientID:       cmd.String("client-id"),
 		TokenFile:      cmd.String("token-file"),
+		UserFlow:       cmd.Bool("user-flow"),
 	}.Normalize()
 }
 

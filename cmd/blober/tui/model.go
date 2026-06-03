@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -83,6 +82,22 @@ type Model struct {
 	containerCursor   int
 	containerButton   int
 	containerErr      error
+
+	providerModal      bool
+	providerModalPanel int
+	providerType       PanelKind
+	providerField      int
+	providerButton     int
+	providerForm       scpConfig
+	providerCursor     int
+	connecting         bool
+
+	keyBrowse        bool
+	keyBrowseDir     string
+	keyBrowseEntries []Entry
+	keyBrowseCursor  int
+	keyBrowseOffset  int
+	keyBrowseErr     error
 }
 
 type Theme struct {
@@ -186,7 +201,18 @@ const (
 
 type entriesLoadedMsg struct {
 	index   int
+	gen     uint64
 	entries []Entry
+	err     error
+}
+
+type providerConnectedMsg struct {
+	index   int
+	gen     uint64
+	kind    PanelKind
+	session *scpSession
+	root    string
+	label   string
 	err     error
 }
 
@@ -268,7 +294,32 @@ func New(cfg Config) Model {
 		m.showingContainers = true
 		m.status = "select a container"
 	}
+	m.panels[0].provider = m.makeAzureProvider()
+	m.providerModalPanel = -1
 	return m
+}
+
+func (m Model) makeAzureProvider() Provider {
+	return azureProvider{client: m.client, container: m.container}
+}
+
+// resolveProvider returns the panel's provider, falling back to a kind-derived
+// provider for panels constructed without one (used by tests).
+func (m Model) resolveProvider(p panel) Provider {
+	if p.provider != nil {
+		return p.provider
+	}
+	switch p.kind {
+	case RemotePanel:
+		return m.makeAzureProvider()
+	case SCPPanel:
+		if p.scp != nil {
+			return scpProvider{session: p.scp}
+		}
+		return localProvider{}
+	default:
+		return localProvider{}
+	}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -377,6 +428,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		}
+		if m.providerModal {
+			return m.updateProviderModal(msg)
 		}
 		if m.creatingDir {
 			if msg.Type == tea.KeyBackspace || msg.Type == tea.KeyCtrlH {
@@ -503,8 +557,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.themeCursor = 0
 			m.themeButton = -1
 			m.themeDraft = themeValue(m.theme, m.themeCursor)
+		case "p":
+			m.openProviderModal()
 		}
 	case entriesLoadedMsg:
+		if msg.index < 0 || msg.index >= len(m.panels) || msg.gen != m.panels[msg.index].gen {
+			return m, nil
+		}
 		m.panels[msg.index].setEntries(msg.entries, msg.err)
 		if m.pendingSelectSet[msg.index] {
 			m.selectEntry(msg.index, m.pendingSelect[msg.index])
@@ -515,6 +574,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.status = msg.err.Error()
 		}
+	case providerConnectedMsg:
+		return m.applyProviderConnected(msg)
 	case containersLoadedMsg:
 		m.containers = msg.containers
 		m.containerErr = msg.err
@@ -618,6 +679,13 @@ func (m Model) View() string {
 	if m.showingTheme {
 		return renderScreen(overlayCentered(base, m.renderThemeModal(), screenWidth, screenHeight), screenWidth, screenHeight)
 	}
+	if m.providerModal {
+		overlay := m.renderProviderModal()
+		if m.keyBrowse {
+			overlay = m.renderKeyBrowser()
+		}
+		return renderScreen(overlayCentered(base, overlay, screenWidth, screenHeight), screenWidth, screenHeight)
+	}
 	// base is already composed to exactly screenWidth x screenHeight with every
 	// cell painted (header, panels and status fill their own backgrounds), so the
 	// outer renderScreen re-wrap is redundant work on the hot navigation path.
@@ -626,6 +694,13 @@ func (m Model) View() string {
 
 func (m Model) headerText() string {
 	remote := m.panels[0]
+	if remote.kind != RemotePanel {
+		location := remote.location
+		if location == "" {
+			location = "(root)"
+		}
+		return fmt.Sprintf("%s: %s", m.resolveProvider(remote).Label(), location)
+	}
 	account := m.accountName
 	if account == "" {
 		account = "(unknown account)"
@@ -1091,6 +1166,7 @@ func (m Model) renderHelpModal() string {
 		{"c", "copy selected or highlighted item"},
 		{"d", "delete selected or highlighted item"},
 		{"n", "create directory"},
+		{"p", "change pane provider (local/azure/scp)"},
 		{"r", "refresh active panel"},
 		{"t", "edit theme"},
 		{"Esc/q/Ctrl+C", "quit or cancel modal"},
@@ -1350,6 +1426,7 @@ func (m Model) selectContainer() (Model, tea.Cmd) {
 	}
 	m.container = m.containers[m.containerCursor]
 	m.panels[0] = newRemotePanel("")
+	m.panels[0].provider = m.makeAzureProvider()
 	m.showingContainers = false
 	m.containerButton = -1
 	m.status = "selected container " + m.container
@@ -1545,6 +1622,26 @@ func (m *Model) setPendingSelect(index int, path string) {
 	m.pendingSelectSet[index] = true
 }
 
+// resetPanelContent clears the cached listing, selections and pending state for
+// a pane so that stale entries from a previous provider can never be acted on
+// before the new provider's listing arrives.
+func (m *Model) resetPanelContent(index int) {
+	if index < 0 || index >= len(m.panels) {
+		return
+	}
+	p := &m.panels[index]
+	p.entries = nil
+	p.allEntries = nil
+	p.filter = ""
+	p.err = nil
+	p.cursor = 0
+	p.offset = 0
+	p.selected = map[string]Entry{}
+	m.pendingSelect[index] = ""
+	m.pendingSelectSet[index] = false
+	m.rememberedSelect[index] = nil
+}
+
 func (m Model) openCurrent() (Model, tea.Cmd) {
 	p := &m.panels[m.active]
 	entry, ok := p.current()
@@ -1563,20 +1660,12 @@ func (m Model) openCurrent() (Model, tea.Cmd) {
 func (m Model) openParent() (Model, tea.Cmd) {
 	p := &m.panels[m.active]
 	child := p.location
-	m.rememberSelection(m.active)
-	switch p.kind {
-	case LocalPanel:
-		parent := filepath.Dir(p.location)
-		if parent == p.location {
-			return m, nil
-		}
-		p.location = parent
-	case RemotePanel:
-		if p.location == "" {
-			return m, nil
-		}
-		p.location = parentBlobPrefix(p.location)
+	parent, ok := m.resolveProvider(*p).Parent(p.location)
+	if !ok {
+		return m, nil
 	}
+	m.rememberSelection(m.active)
+	p.location = parent
 	p.cursor = 0
 	p.offset = 0
 	m.clearPanelFilter(m.active)
@@ -1667,9 +1756,15 @@ func (m Model) createDirectory() (Model, tea.Cmd) {
 	m.creatingDir = false
 	m.createYes = true
 	m.newDirName = ""
-	if m.panels[m.active].kind == RemotePanel {
-		p := &m.panels[m.active]
-		p.location = azure_storage.JoinBlobPrefix(p.location, name) + "/"
+	p := &m.panels[m.active]
+	prov := m.resolveProvider(*p)
+	if prov.Virtual() {
+		child, _, err := prov.Mkdir(context.Background(), p.location, name)
+		if err != nil {
+			m.status = err.Error()
+			return m, nil
+		}
+		p.location = child
 		p.cursor = 0
 		p.offset = 0
 		m.status = "created virtual directory " + name
@@ -1757,21 +1852,12 @@ func (m Model) overwriteTarget() string {
 
 func (m Model) listCmd(index int) tea.Cmd {
 	p := m.panels[index]
+	prov := m.resolveProvider(p)
+	gen := p.gen
+	location := p.location
 	return func() tea.Msg {
-		var (
-			entries []Entry
-			err     error
-		)
-		switch p.kind {
-		case LocalPanel:
-			entries, err = listLocal(p.location)
-		case RemotePanel:
-			if m.container == "" {
-				return entriesLoadedMsg{index: index, entries: nil, err: nil}
-			}
-			entries, err = listRemote(context.Background(), m.client, m.container, p.location)
-		}
-		return entriesLoadedMsg{index: index, entries: entries, err: err}
+		entries, err := prov.List(context.Background(), location)
+		return entriesLoadedMsg{index: index, gen: gen, entries: entries, err: err}
 	}
 }
 
@@ -1794,12 +1880,10 @@ func (m Model) listContainersCmd() tea.Cmd {
 
 func (m Model) mkdirCmd(index int, name string) tea.Cmd {
 	p := m.panels[index]
+	prov := m.resolveProvider(p)
+	location := p.location
 	return func() tea.Msg {
-		var err error
-		switch p.kind {
-		case LocalPanel:
-			err = os.Mkdir(filepath.Join(p.location, name), 0o755)
-		}
+		_, _, err := prov.Mkdir(context.Background(), location, name)
 		return mkdirDoneMsg{index: index, name: name, err: err}
 	}
 }
@@ -1841,17 +1925,12 @@ func (m Model) checkOverwriteConflictsCmd(sourceIndex int, sources []Entry) tea.
 }
 
 func (m Model) copyTargetExists(ctx context.Context, source, target panel, item copyItem) (bool, error) {
-	if source.kind == LocalPanel {
-		key := azure_storage.JoinBlobPrefix(target.location, item.targetRel)
-		return remoteBlobExists(ctx, m.client, m.container, key)
-	}
-	dst := filepath.Join(target.location, item.targetRel)
-	if _, err := os.Stat(dst); err == nil {
-		return true, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
+	prov := m.resolveProvider(target)
+	dst, err := prov.Join(target.location, item.targetRel)
+	if err != nil {
 		return false, err
 	}
-	return false, nil
+	return prov.Exists(ctx, dst)
 }
 
 func (m Model) copyTargetDisplay(item copyItem) string {
@@ -1859,18 +1938,20 @@ func (m Model) copyTargetDisplay(item copyItem) string {
 }
 
 func (m Model) copyTargetDisplayFor(sourceIndex int, item copyItem) string {
-	source := m.panels[sourceIndex]
 	target := m.panels[1-sourceIndex]
-	if source.kind == LocalPanel {
-		return azure_storage.JoinBlobPrefix(target.location, item.targetRel)
+	dst, err := m.resolveProvider(target).Join(target.location, item.targetRel)
+	if err != nil {
+		return item.targetRel
 	}
-	return filepath.Join(target.location, item.targetRel)
+	return dst
 }
 
 func (m Model) copyCmd(ctx context.Context, sourceIndex int, items []copyItem, overwrite bool, progressCh chan tea.Msg) tea.Cmd {
+	source := m.panels[sourceIndex]
+	target := m.panels[1-sourceIndex]
+	srcProv := m.resolveProvider(source)
+	dstProv := m.resolveProvider(target)
 	return func() tea.Msg {
-		source := m.panels[sourceIndex]
-		target := m.panels[1-sourceIndex]
 		if !overwrite {
 			for i, item := range items {
 				exists, err := m.copyTargetExists(ctx, source, target, item)
@@ -1887,61 +1968,80 @@ func (m Model) copyCmd(ctx context.Context, sourceIndex int, items []copyItem, o
 		var batchDone int64
 		batchTotal := totalCopySize(items)
 		for _, item := range items {
-			entry := item.entry
-			name := item.targetRel
 			completedBeforeFile := batchDone
-			reporter := newProgressThrottler(name, completedBeforeFile, batchTotal, progressCh, time.Now)
+			reporter := newProgressThrottler(item.targetRel, completedBeforeFile, batchTotal, progressCh, time.Now)
 			report := reporter.report
 
-			var err error
-			if source.kind == LocalPanel {
-				key := azure_storage.JoinBlobPrefix(target.location, item.targetRel)
-				err = azure_storage.UploadBlobWithProgress(ctx, m.client, m.container, key, entry.Path, report)
-				if errors.Is(err, context.Canceled) {
-					cleanupCtx := context.Background()
-					if cleanupErr := cleanupRemoteBlob(cleanupCtx, m.client, m.container, key); cleanupErr != nil {
-						err = fmt.Errorf("%w; cleanup failed for %s: %v", err, key, cleanupErr)
-					}
-				}
-			} else {
-				dst := filepath.Join(target.location, item.targetRel)
-				if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-					close(progressCh)
-					return copyDoneMsg{source: sourceIndex, err: err}
-				}
-				err = azure_storage.DownloadBlobFileWithProgress(ctx, m.client, m.container, entry.Path, dst, overwrite, report)
-			}
-			if err != nil {
+			if err := m.copyOne(ctx, srcProv, dstProv, target.location, item, report); err != nil {
 				close(progressCh)
 				return copyDoneMsg{source: sourceIndex, err: err}
 			}
-			batchDone += entry.Size
+			batchDone += item.entry.Size
 		}
 		close(progressCh)
 		return copyDoneMsg{source: sourceIndex}
 	}
 }
 
+// copyOne streams a single file from the source provider to the destination
+// provider, reporting progress as bytes are read.
+func (m Model) copyOne(ctx context.Context, srcProv, dstProv Provider, targetLocation string, item copyItem, report func(done, total int64)) error {
+	dst, err := dstProv.Join(targetLocation, item.targetRel)
+	if err != nil {
+		return err
+	}
+	// Only a destination that did not already exist may be cleaned up on
+	// cancellation; otherwise we would delete a pre-existing file the user is
+	// overwriting.
+	preExisting, _ := dstProv.Exists(ctx, dst)
+	rc, size, err := srcProv.Open(ctx, item.entry.Path)
+	if err != nil {
+		return err
+	}
+	if size < 0 {
+		size = item.entry.Size
+	}
+	report(0, size)
+	reader := &progressReader{ctx: ctx, r: rc, report: func(done int64) { report(done, size) }}
+	createErr := dstProv.Create(ctx, dst, size, reader)
+	closeErr := rc.Close()
+	if createErr != nil {
+		if (errors.Is(createErr, context.Canceled) || ctx.Err() != nil) && !preExisting {
+			// Best-effort cleanup of a partially written, newly created target.
+			_ = dstProv.Remove(context.Background(), Entry{Path: dst})
+		}
+		return createErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	report(size, size)
+	return nil
+}
+
 func (m Model) expandCopySources(ctx context.Context, source panel, sources []Entry) ([]copyItem, error) {
+	prov := m.resolveProvider(source)
 	var items []copyItem
 	for _, entry := range sources {
 		if !entry.IsDir {
 			items = append(items, copyItem{entry: entry, targetRel: copyTargetName(entry)})
 			continue
 		}
-		if source.kind == LocalPanel {
-			expanded, err := expandLocalDirectory(entry)
-			if err != nil {
-				return nil, err
-			}
-			items = append(items, expanded...)
-			continue
-		}
-		expanded, err := expandRemoteDirectory(ctx, m.client, m.container, entry)
+		walked, err := prov.Walk(ctx, entry)
 		if err != nil {
 			return nil, err
 		}
-		items = append(items, expanded...)
+		for _, item := range walked {
+			items = append(items, copyItem{
+				entry: Entry{
+					Name:         item.Rel,
+					Path:         item.Path,
+					Size:         item.Size,
+					LastModified: item.ModTime,
+				},
+				targetRel: item.Rel,
+			})
+		}
 	}
 	return items, nil
 }
@@ -1994,65 +2094,6 @@ func (p *progressThrottler) report(done, total int64) {
 	}
 }
 
-func expandLocalDirectory(entry Entry) ([]copyItem, error) {
-	base := copyTargetName(entry)
-	var items []copyItem
-	err := filepath.WalkDir(entry.Path, func(filePath string, dirEntry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if dirEntry.IsDir() {
-			return nil
-		}
-		info, err := dirEntry.Info()
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(entry.Path, filePath)
-		if err != nil {
-			return err
-		}
-		targetRel := path.Join(base, filepath.ToSlash(rel))
-		items = append(items, copyItem{
-			entry: Entry{
-				Name:         targetRel,
-				Path:         filePath,
-				Size:         info.Size(),
-				LastModified: info.ModTime(),
-			},
-			targetRel: targetRel,
-		})
-		return nil
-	})
-	return items, err
-}
-
-func expandRemoteDirectory(ctx context.Context, client *azblob.Client, container string, entry Entry) ([]copyItem, error) {
-	blobs, err := azure_storage.ListBlobs(ctx, client, container, entry.Path)
-	if err != nil {
-		return nil, err
-	}
-	base := copyTargetName(entry)
-	items := make([]copyItem, 0, len(blobs))
-	for _, blob := range blobs {
-		rel := strings.TrimPrefix(blob.Key, entry.Path)
-		if rel == "" {
-			continue
-		}
-		targetRel := filepath.FromSlash(path.Join(base, rel))
-		items = append(items, copyItem{
-			entry: Entry{
-				Name:         path.Join(base, rel),
-				Path:         blob.Key,
-				Size:         blob.Size,
-				LastModified: blob.LastModified,
-			},
-			targetRel: targetRel,
-		})
-	}
-	return items, nil
-}
-
 func copyTargetName(entry Entry) string {
 	name := strings.TrimRight(entry.Name, "/\\")
 	if name == "" {
@@ -2074,21 +2115,10 @@ func copyHasDirectories(entries []Entry) bool {
 }
 
 func (m Model) deleteCmd(sourceIndex int, sources []Entry) tea.Cmd {
+	prov := m.resolveProvider(m.panels[sourceIndex])
 	return func() tea.Msg {
-		source := m.panels[sourceIndex]
 		for _, entry := range sources {
-			var err error
-			switch source.kind {
-			case LocalPanel:
-				err = removeLocalEntry(entry)
-			case RemotePanel:
-				if entry.IsDir {
-					err = deleteRemotePrefix(context.Background(), m.client, m.container, entry.Path)
-				} else {
-					err = cleanupRemoteBlob(context.Background(), m.client, m.container, entry.Path)
-				}
-			}
-			if err != nil {
+			if err := prov.Remove(context.Background(), entry); err != nil {
 				return deleteDoneMsg{source: sourceIndex, err: err}
 			}
 		}
@@ -2389,6 +2419,7 @@ func applyTheme(theme Theme) {
 	errorStyle = lipgloss.NewStyle().Foreground(mcError).Background(mcBlue).ColorWhitespace(true)
 	modalTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(mcBlack).Background(mcModalBackground).ColorWhitespace(true)
 	modalRowStyle = lipgloss.NewStyle().Foreground(mcBlack).Background(mcModalBackground).ColorWhitespace(true)
+	modalCursorStyle = lipgloss.NewStyle().Foreground(mcModalBackground).Background(mcBlack).ColorWhitespace(true)
 	dialogButtonStyle = lipgloss.NewStyle().Foreground(mcBlack).Background(mcModalBackground).ColorWhitespace(true)
 	selectedDialogButtonStyle = lipgloss.NewStyle().Bold(true).Foreground(mcBlack).Background(mcLightBlue).ColorWhitespace(true)
 	cancelButtonStyle = lipgloss.NewStyle().Bold(true).Foreground(mcBlack).Background(mcLightBlue).ColorWhitespace(true).Align(lipgloss.Center)
@@ -2419,6 +2450,7 @@ var (
 	errorStyle                lipgloss.Style
 	modalTitleStyle           lipgloss.Style
 	modalRowStyle             lipgloss.Style
+	modalCursorStyle          lipgloss.Style
 	dialogButtonStyle         lipgloss.Style
 	selectedDialogButtonStyle lipgloss.Style
 	cancelButtonStyle         lipgloss.Style

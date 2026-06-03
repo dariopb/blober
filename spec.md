@@ -333,6 +333,22 @@ Behavior:
 - Existing targets are not overwritten unless the user confirms the overwrite in
   the TUI.
 - `r` refreshes the active panel.
+- `p` opens a fixed-size centered modal to choose the storage provider for the
+  active panel: Local filesystem, Azure Blob Storage, or SCP (ssh/sftp). The
+  Type row cycles with the left/right arrows. Selecting SCP reveals Host, Port,
+  User, Password, and Key file fields. A host and user are required; if both
+  Password and Key file are left empty, the connection falls back to the user's
+  default SSH credentials (ssh-agent and the standard `~/.ssh` keys). Pressing
+  Enter on the Key file field opens a directory browser (starting in the key's
+  directory, otherwise `~/.ssh`) to navigate and pick a private key.
+  Local and Azure switch the panel immediately; SCP dials the host
+  asynchronously and shows a connecting state with `Esc` to cancel. The modal
+  has GUI-style Connect and Cancel buttons. The SCP text fields are editable
+  with a visible block cursor: left/right move the cursor within the field,
+  Home/End jump to the start/end, typing inserts at the cursor, Backspace
+  deletes the character before it, and Delete removes the character at it. See
+  `vfs_providers.md` for the underlying VFS provider abstraction and SCP
+  connection/known-hosts behavior.
 - `q`, `Esc`, or `Ctrl+C` exits the TUI.
 - The bottom status line shows the active panel, currently highlighted file,
   and full byte size, plus errors or informational messages when present.

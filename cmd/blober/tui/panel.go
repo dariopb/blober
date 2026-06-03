@@ -17,6 +17,7 @@ type PanelKind int
 const (
 	LocalPanel PanelKind = iota
 	RemotePanel
+	SCPPanel
 )
 
 type Entry struct {
@@ -30,6 +31,9 @@ type Entry struct {
 
 type panel struct {
 	kind       PanelKind
+	provider   Provider
+	scp        *scpSession
+	gen        uint64
 	title      string
 	location   string
 	allEntries []Entry
@@ -42,7 +46,7 @@ type panel struct {
 }
 
 func newLocalPanel(path string) panel {
-	return panel{kind: LocalPanel, title: "Local", location: path, selected: map[string]Entry{}}
+	return panel{kind: LocalPanel, provider: localProvider{}, title: "Local", location: path, selected: map[string]Entry{}}
 }
 
 func newRemotePanel(prefix string) panel {
@@ -168,7 +172,9 @@ func listLocal(path string) ([]Entry, error) {
 	for _, dirEntry := range dirEntries {
 		info, err := dirEntry.Info()
 		if err != nil {
-			return nil, err
+			// Skip entries whose metadata can't be read (e.g. a broken symlink)
+			// so one bad entry doesn't make the whole directory unbrowseable.
+			continue
 		}
 		name := dirEntry.Name()
 		displayName := name

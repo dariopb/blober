@@ -302,6 +302,38 @@ func DownloadBlobFileWithProgress(ctx context.Context, c *azblob.Client, contain
 	return os.Rename(tmpName, dstPath)
 }
 
+// OpenBlobStream opens a blob for streaming reads. The caller must close the
+// returned reader. size is the blob content length (-1 when unknown).
+func OpenBlobStream(ctx context.Context, c *azblob.Client, container, key string) (io.ReadCloser, int64, error) {
+	if err := ValidateContainerName(container); err != nil {
+		return nil, 0, err
+	}
+	if err := ValidateBlobKey(key); err != nil {
+		return nil, 0, err
+	}
+	resp, err := c.DownloadStream(ctx, container, key, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	size := int64(-1)
+	if resp.ContentLength != nil {
+		size = *resp.ContentLength
+	}
+	return resp.Body, size, nil
+}
+
+// UploadBlobStream uploads the contents of r to the given blob key.
+func UploadBlobStream(ctx context.Context, c *azblob.Client, container, key string, r io.Reader) error {
+	if err := ValidateContainerName(container); err != nil {
+		return err
+	}
+	if err := ValidateBlobKey(key); err != nil {
+		return err
+	}
+	_, err := c.UploadStream(ctx, container, key, r, nil)
+	return err
+}
+
 func progressAdapter(progress ProgressFunc, total int64) func(int64) {
 	if progress == nil {
 		return nil

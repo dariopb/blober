@@ -29,14 +29,16 @@ type Entry struct {
 }
 
 type panel struct {
-	kind     PanelKind
-	title    string
-	location string
-	entries  []Entry
-	cursor   int
-	offset   int
-	selected map[string]Entry
-	err      error
+	kind       PanelKind
+	title      string
+	location   string
+	allEntries []Entry
+	entries    []Entry
+	filter     string
+	cursor     int
+	offset     int
+	selected   map[string]Entry
+	err        error
 }
 
 func newLocalPanel(path string) panel {
@@ -59,8 +61,8 @@ func (p *panel) toggleCurrent() string {
 	if !ok {
 		return "nothing selected"
 	}
-	if entry.IsDir {
-		return "directory selection is not supported"
+	if entry.parent {
+		return "parent directory selection is not supported"
 	}
 	if _, ok := p.selected[entry.Path]; ok {
 		delete(p.selected, entry.Path)
@@ -108,8 +110,44 @@ func (p panel) deleteSources() []Entry {
 
 func (p *panel) setEntries(entries []Entry, err error) {
 	sortEntries(entries)
-	p.entries = entries
+	p.allEntries = entries
 	p.err = err
+	p.applyFilter()
+	p.clampCursor()
+}
+
+func (p *panel) setFilter(filter string) {
+	if p.allEntries == nil {
+		p.allEntries = p.entries
+	}
+	if p.filter == filter {
+		return
+	}
+	p.filter = filter
+	p.applyFilter()
+	p.clampCursor()
+}
+
+func (p *panel) applyFilter() {
+	source := p.allEntries
+	if source == nil {
+		source = p.entries
+	}
+	filter := strings.ToLower(strings.TrimSpace(p.filter))
+	if filter == "" {
+		p.entries = source
+		return
+	}
+	filtered := make([]Entry, 0, len(source))
+	for _, entry := range source {
+		if entry.parent || strings.Contains(strings.ToLower(displayEntryName(entry)), filter) {
+			filtered = append(filtered, entry)
+		}
+	}
+	p.entries = filtered
+}
+
+func (p *panel) clampCursor() {
 	if p.cursor >= len(p.entries) {
 		p.cursor = len(p.entries) - 1
 	}

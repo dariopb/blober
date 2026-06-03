@@ -266,10 +266,14 @@ Behavior:
 - Arrow keys or `j`/`k` move the selection in the active panel. `PageUp` and
   `PageDown` move by one visible pane page. `Home` moves to the first entry,
   and `End` moves to the last entry.
-- `Space` toggles selection for the highlighted file in the active panel.
-  Selected files render in yellow, matching Midnight Commander-style visual
-  feedback. Pressing `Space` again unselects the file. Selected directories
-  are copied recursively after confirmation.
+- `/` edits a live filter for the active panel. Typing filters the visible
+  entries by displayed name, `Backspace` removes characters, `Enter` accepts
+  the filter, and `Esc` cancels the edit. The active panel filter is shown in
+  the status bar.
+- `Space` toggles selection for the highlighted file or directory in the active
+  panel. Selected items render in yellow, matching Midnight Commander-style
+  visual feedback. Pressing `Space` again unselects the item. Selected
+  directories are copied recursively after confirmation.
 - `Enter` or `RightArrow` opens a directory. For the remote panel, directories
   are virtual prefixes ending in `/`; for the local panel, directories are
   filesystem directories.

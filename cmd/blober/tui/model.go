@@ -41,12 +41,14 @@ type Model struct {
 	force       bool
 	theme       Theme
 
-	panels        [2]panel
-	active        int
-	status        string
-	width         int
-	height        int
-	pendingSelect [2]string
+	panels           [2]panel
+	active           int
+	status           string
+	width            int
+	height           int
+	pendingSelect    [2]string
+	pendingSelectSet [2]bool
+	rememberedSelect [2]map[string]string
 
 	copying      bool
 	copyProgress transferProgress
@@ -72,6 +74,9 @@ type Model struct {
 	creatingDir        bool
 	createYes          bool
 	newDirName         string
+	filtering          bool
+	filterPanel        int
+	filterOriginal     string
 
 	showingContainers bool
 	containers        []string
@@ -252,7 +257,12 @@ func New(cfg Config) Model {
 			newLocalPanel(localPath),
 		},
 		containerButton: -1,
+		filterPanel:     -1,
 		status:          helpHint,
+		rememberedSelect: [2]map[string]string{
+			{},
+			{},
+		},
 	}
 	if m.container == "" && (m.accountName != "" || m.client != nil) {
 		m.showingContainers = true
@@ -441,6 +451,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.filtering {
+			return m.updateFilter(msg)
+		}
 		switch msg.String() {
 		case "ctrl+c", "esc", "q":
 			return m, tea.Quit
@@ -481,6 +494,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.createYes = true
 			m.newDirName = ""
 			m.status = "enter new directory name"
+		case "/":
+			m.filtering = true
+			m.filterPanel = m.active
+			m.filterOriginal = m.panels[m.active].filter
 		case "t":
 			m.showingTheme = true
 			m.themeCursor = 0
@@ -489,10 +506,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case entriesLoadedMsg:
 		m.panels[msg.index].setEntries(msg.entries, msg.err)
-		if m.pendingSelect[msg.index] != "" {
+		if m.pendingSelectSet[msg.index] {
 			m.selectEntry(msg.index, m.pendingSelect[msg.index])
 			m.pendingSelect[msg.index] = ""
+			m.pendingSelectSet[msg.index] = false
 		}
+		m.clampPanelViewport(msg.index)
 		if msg.err != nil {
 			m.status = msg.err.Error()
 		}
@@ -579,7 +598,7 @@ func (m Model) View() string {
 	left := m.renderPanel(0, leftWidth, panelAreaHeight)
 	right := m.renderPanel(1, rightWidth, panelAreaHeight)
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
-	status := fullWidthStyle(statusStyle, screenWidth).Render(truncate(m.footerText(), screenWidth))
+	status := m.renderFooter(screenWidth)
 	base := lipgloss.JoinVertical(lipgloss.Left, header, body, status)
 	if m.copying {
 		return renderScreen(overlayCentered(base, m.renderProgressModal(), screenWidth, screenHeight), screenWidth, screenHeight)
@@ -599,7 +618,10 @@ func (m Model) View() string {
 	if m.showingTheme {
 		return renderScreen(overlayCentered(base, m.renderThemeModal(), screenWidth, screenHeight), screenWidth, screenHeight)
 	}
-	return renderScreen(base, screenWidth, screenHeight)
+	// base is already composed to exactly screenWidth x screenHeight with every
+	// cell painted (header, panels and status fill their own backgrounds), so the
+	// outer renderScreen re-wrap is redundant work on the hot navigation path.
+	return base
 }
 
 func (m Model) headerText() string {
@@ -635,6 +657,47 @@ func (m Model) footerText() string {
 	return strings.Join(parts, " | ")
 }
 
+func (m Model) renderFooter(width int) string {
+	filterText, hasFilter := m.filterStatusText()
+	if !hasFilter {
+		return fullWidthStyle(statusStyle, width).Render(truncate(m.footerText(), width))
+	}
+	normalText := m.footerText()
+	if normalText == "" {
+		return fullWidthStyle(filterStatusStyle, width).Render(truncate(filterText, width))
+	}
+	separator := " | "
+	filterText = truncate(filterText, width)
+	filterWidth := lipgloss.Width(filterText)
+	normalWidth := width - lipgloss.Width(separator) - filterWidth
+	if normalWidth < 0 {
+		return fullWidthStyle(filterStatusStyle, width).Render(truncate(filterText, width))
+	}
+	normalText = truncate(normalText, normalWidth)
+	normalSegment := statusStyle.Render(normalText + separator)
+	filterSegment := filterStatusStyle.Render(filterText)
+	remaining := width - lipgloss.Width(normalText) - lipgloss.Width(separator) - filterWidth
+	if remaining < 0 {
+		remaining = 0
+	}
+	return normalSegment + filterSegment + statusStyle.Render(strings.Repeat(" ", remaining))
+}
+
+func (m Model) filterStatusText() (string, bool) {
+	index := m.active
+	if m.filtering {
+		index = m.filterPanel
+	}
+	if index < 0 || index >= len(m.panels) {
+		return "", false
+	}
+	filter := m.panels[index].filter
+	if filter == "" && !m.filtering {
+		return "", false
+	}
+	return "filter: " + filter, true
+}
+
 func (m Model) renderPanel(index, outerWidth, outerHeight int) string {
 	p := m.panels[index]
 	style := inactivePanelStyle
@@ -661,21 +724,21 @@ func (m Model) renderPanel(index, outerWidth, outerHeight int) string {
 			continue
 		}
 		entry := p.entries[entryIndex]
-		line := renderEntryColumns(entry, textWidth, false)
-		if _, ok := p.selected[entry.Path]; ok {
-			line = fullWidthStyle(selectedStyle, textWidth).Render(line)
-		} else {
-			line = fullWidthStyle(rowStyle, textWidth).Render(line)
+		rowStyleForEntry := rowStyle
+		cursorRow := index == m.active && entryIndex == p.cursor
+		_, selected := p.selected[entry.Path]
+		switch {
+		case cursorRow && selected:
+			rowStyleForEntry = selectedCursorStyle
+		case cursorRow:
+			rowStyleForEntry = cursorStyle
+		case selected:
+			rowStyleForEntry = selectedStyle
 		}
-		if index == m.active && entryIndex == p.cursor {
-			line = fullWidthStyle(cursorStyle, textWidth).Render(renderEntryColumns(entry, textWidth, true))
-			if _, ok := p.selected[entry.Path]; ok {
-				line = fullWidthStyle(selectedCursorStyle, textWidth).Render(renderEntryColumns(entry, textWidth, true))
-			}
-		}
+		line := fullWidthStyle(rowStyleForEntry, textWidth).Render(renderEntryColumns(entry, textWidth, cursorRow))
 		lines = append(lines, line)
 	}
-	return style.Width(blockWidth).Height(blockHeight).MaxWidth(outerWidth).MaxHeight(outerHeight).Render(strings.Join(lines, "\n"))
+	return style.Width(blockWidth).Height(blockHeight).Render(strings.Join(lines, "\n"))
 }
 
 func columnHeader(width int) string {
@@ -1021,7 +1084,8 @@ func (m Model) renderHelpModal() string {
 		{"Up/Down or j/k", "move selection"},
 		{"PageUp/PageDown", "move by one page"},
 		{"Home/End", "move to first or last entry"},
-		{"Space", "toggle file selection"},
+		{"Space", "toggle item selection"},
+		{"/", "filter active panel"},
 		{"Enter/Right", "open directory"},
 		{"Backspace/Left or h", "go to parent"},
 		{"c", "copy selected or highlighted item"},
@@ -1313,6 +1377,35 @@ func (m *Model) moveCursorTo(index int) {
 	}
 }
 
+func (m *Model) clampPanelViewport(index int) {
+	if index < 0 || index >= len(m.panels) {
+		return
+	}
+	p := &m.panels[index]
+	if len(p.entries) == 0 {
+		p.cursor = 0
+		p.offset = 0
+		return
+	}
+	if p.cursor < 0 {
+		p.cursor = 0
+	}
+	if p.cursor >= len(p.entries) {
+		p.cursor = len(p.entries) - 1
+	}
+	if p.offset < 0 || p.cursor < p.offset {
+		p.offset = p.cursor
+	}
+	visible := m.panePageSizeFor(index)
+	if p.cursor >= p.offset+visible {
+		p.offset = p.cursor - visible + 1
+	}
+	maxOffset := max(0, len(p.entries)-visible)
+	if p.offset > maxOffset {
+		p.offset = maxOffset
+	}
+}
+
 func (m Model) panePageSize() int {
 	return m.panePageSizeFor(m.active)
 }
@@ -1339,9 +1432,9 @@ func (m Model) panePageSizeFor(index int) int {
 	return max(1, textHeight-headerLines)
 }
 
-func (m *Model) selectEntry(index int, path string) {
+func (m *Model) selectEntry(index int, path string) bool {
 	if index < 0 || index >= len(m.panels) {
-		return
+		return false
 	}
 	p := &m.panels[index]
 	for i, entry := range p.entries {
@@ -1354,9 +1447,102 @@ func (m *Model) selectEntry(index int, path string) {
 			if p.cursor >= p.offset+visible {
 				p.offset = p.cursor - visible + 1
 			}
-			return
+			return true
 		}
 	}
+	return false
+}
+
+func (m *Model) applyPanelFilter(index int, filter string) {
+	if index < 0 || index >= len(m.panels) {
+		return
+	}
+	current, hasCurrent := m.panels[index].current()
+	m.panels[index].setFilter(filter)
+	if hasCurrent && m.selectEntry(index, current.Path) {
+		return
+	}
+	m.panels[index].cursor = 0
+	m.panels[index].offset = 0
+	m.clampPanelViewport(index)
+}
+
+func (m Model) updateFilter(msg tea.KeyMsg) (Model, tea.Cmd) {
+	index := m.filterPanel
+	if index < 0 || index >= len(m.panels) {
+		m.filtering = false
+		m.filterPanel = -1
+		return m, nil
+	}
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.applyPanelFilter(index, m.filterOriginal)
+		m.filtering = false
+		m.filterPanel = -1
+		m.filterOriginal = ""
+	case "enter":
+		m.filtering = false
+		m.filterPanel = -1
+		m.filterOriginal = ""
+	default:
+		filter := m.panels[index].filter
+		if msg.Type == tea.KeyBackspace || msg.Type == tea.KeyCtrlH {
+			runes := []rune(filter)
+			if len(runes) > 0 {
+				filter = string(runes[:len(runes)-1])
+			}
+		} else if len(msg.Runes) > 0 {
+			filter += string(msg.Runes)
+		}
+		m.applyPanelFilter(index, filter)
+	}
+	return m, nil
+}
+
+func (m *Model) clearPanelFilter(index int) {
+	if index < 0 || index >= len(m.panels) {
+		return
+	}
+	if m.panels[index].filter != "" {
+		m.applyPanelFilter(index, "")
+	}
+	if m.filtering && m.filterPanel == index {
+		m.filtering = false
+		m.filterPanel = -1
+		m.filterOriginal = ""
+	}
+}
+
+func (m *Model) rememberSelection(index int) {
+	if index < 0 || index >= len(m.panels) {
+		return
+	}
+	entry, ok := m.panels[index].current()
+	if !ok {
+		return
+	}
+	if m.rememberedSelect[index] == nil {
+		m.rememberedSelect[index] = map[string]string{}
+	}
+	m.rememberedSelect[index][m.panels[index].location] = entry.Path
+}
+
+func (m *Model) restoreRememberedSelection(index int, location string) {
+	if index < 0 || index >= len(m.panels) || m.rememberedSelect[index] == nil {
+		return
+	}
+	path, ok := m.rememberedSelect[index][location]
+	if ok {
+		m.setPendingSelect(index, path)
+	}
+}
+
+func (m *Model) setPendingSelect(index int, path string) {
+	if index < 0 || index >= len(m.panels) {
+		return
+	}
+	m.pendingSelect[index] = path
+	m.pendingSelectSet[index] = true
 }
 
 func (m Model) openCurrent() (Model, tea.Cmd) {
@@ -1365,15 +1551,19 @@ func (m Model) openCurrent() (Model, tea.Cmd) {
 	if !ok || !entry.IsDir {
 		return m, nil
 	}
+	m.rememberSelection(m.active)
 	p.location = entry.Path
 	p.cursor = 0
 	p.offset = 0
+	m.clearPanelFilter(m.active)
+	m.restoreRememberedSelection(m.active, p.location)
 	return m, m.listCmd(m.active)
 }
 
 func (m Model) openParent() (Model, tea.Cmd) {
 	p := &m.panels[m.active]
 	child := p.location
+	m.rememberSelection(m.active)
 	switch p.kind {
 	case LocalPanel:
 		parent := filepath.Dir(p.location)
@@ -1389,7 +1579,8 @@ func (m Model) openParent() (Model, tea.Cmd) {
 	}
 	p.cursor = 0
 	p.offset = 0
-	m.pendingSelect[m.active] = child
+	m.clearPanelFilter(m.active)
+	m.setPendingSelect(m.active, child)
 	return m, m.listCmd(m.active)
 }
 
@@ -2194,6 +2385,7 @@ func applyTheme(theme Theme) {
 	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(mcBrightYellow).Background(mcBlue).ColorWhitespace(true)
 	selectedCursorStyle = lipgloss.NewStyle().Bold(true).Foreground(mcBrightYellow).Background(mcLightBlue).ColorWhitespace(true)
 	statusStyle = lipgloss.NewStyle().Foreground(mcBlack).Background(mcLightBlue).ColorWhitespace(true)
+	filterStatusStyle = lipgloss.NewStyle().Bold(true).Foreground(mcBlack).Background(mcBrightYellow).ColorWhitespace(true)
 	errorStyle = lipgloss.NewStyle().Foreground(mcError).Background(mcBlue).ColorWhitespace(true)
 	modalTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(mcBlack).Background(mcModalBackground).ColorWhitespace(true)
 	modalRowStyle = lipgloss.NewStyle().Foreground(mcBlack).Background(mcModalBackground).ColorWhitespace(true)
@@ -2223,6 +2415,7 @@ var (
 	selectedStyle             lipgloss.Style
 	selectedCursorStyle       lipgloss.Style
 	statusStyle               lipgloss.Style
+	filterStatusStyle         lipgloss.Style
 	errorStyle                lipgloss.Style
 	modalTitleStyle           lipgloss.Style
 	modalRowStyle             lipgloss.Style

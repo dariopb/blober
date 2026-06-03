@@ -12,6 +12,14 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+func entryNames(entries []Entry) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name)
+	}
+	return names
+}
+
 func TestSpaceTogglesSelectedFile(t *testing.T) {
 	m := New(Config{})
 	m.panels[0].entries = []Entry{{Name: "a.txt", Path: "a.txt", Size: 10}}
@@ -26,6 +34,37 @@ func TestSpaceTogglesSelectedFile(t *testing.T) {
 	m = updated.(Model)
 	if _, ok := m.panels[0].selected["a.txt"]; ok {
 		t.Fatal("expected file to be unselected")
+	}
+}
+
+func TestSpaceTogglesSelectedDirectory(t *testing.T) {
+	m := New(Config{})
+	m.panels[0].entries = []Entry{{Name: "dir/", Path: "dir", IsDir: true}}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(Model)
+	if _, ok := m.panels[0].selected["dir"]; !ok {
+		t.Fatal("expected directory to be selected")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(Model)
+	if _, ok := m.panels[0].selected["dir"]; ok {
+		t.Fatal("expected directory to be unselected")
+	}
+}
+
+func TestSpaceDoesNotSelectParentDirectory(t *testing.T) {
+	m := New(Config{})
+	m.panels[0].entries = []Entry{{Name: "..", Path: "", IsDir: true, parent: true}}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(Model)
+	if len(m.panels[0].selected) != 0 {
+		t.Fatalf("parent entry should not be selected: %#v", m.panels[0].selected)
+	}
+	if !strings.Contains(m.status, "parent directory selection is not supported") {
+		t.Fatalf("status = %q, want parent selection warning", m.status)
 	}
 }
 
@@ -641,6 +680,101 @@ func TestViewUsesExactScreenGeometry(t *testing.T) {
 	}
 }
 
+func TestSlashFiltersActivePane(t *testing.T) {
+	m := New(Config{})
+	m.panels[0].entries = []Entry{
+		{Name: "alpha.txt", Path: "alpha.txt", Size: 1},
+		{Name: "beta.txt", Path: "beta.txt", Size: 1},
+		{Name: "alphabet.txt", Path: "alphabet.txt", Size: 1},
+	}
+	m.panels[1].entries = []Entry{
+		{Name: "local-alpha.txt", Path: "/tmp/local-alpha.txt", Size: 1},
+		{Name: "local-beta.txt", Path: "/tmp/local-beta.txt", Size: 1},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	for _, r := range "alp" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+
+	if !m.filtering || m.filterPanel != 0 {
+		t.Fatalf("expected filter mode on active pane, filtering=%v panel=%d", m.filtering, m.filterPanel)
+	}
+	if got := entryNames(m.panels[0].entries); strings.Join(got, ",") != "alpha.txt,alphabet.txt" {
+		t.Fatalf("filtered remote entries = %v, want alpha matches", got)
+	}
+	if got := entryNames(m.panels[1].entries); strings.Join(got, ",") != "local-alpha.txt,local-beta.txt" {
+		t.Fatalf("inactive local entries changed: %v", got)
+	}
+	if got := m.View(); !strings.Contains(got, "filter: alp") {
+		t.Fatalf("view missing active filter:\n%s", got)
+	}
+}
+
+func TestFilterBackspaceEnterAndEscape(t *testing.T) {
+	m := New(Config{})
+	m.panels[0].entries = []Entry{
+		{Name: "alpha.txt", Path: "alpha.txt", Size: 1},
+		{Name: "beta.txt", Path: "beta.txt", Size: 1},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	for _, r := range "alphaz" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	m = updated.(Model)
+	if m.panels[0].filter != "alpha" || len(m.panels[0].entries) != 1 {
+		t.Fatalf("backspace filter=%q entries=%v, want alpha match", m.panels[0].filter, entryNames(m.panels[0].entries))
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.filtering || m.panels[0].filter != "alpha" {
+		t.Fatalf("enter should accept filter, filtering=%v filter=%q", m.filtering, m.panels[0].filter)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	for _, r := range "x" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.filtering || m.panels[0].filter != "alpha" || len(m.panels[0].entries) != 1 {
+		t.Fatalf("esc should restore accepted filter, filtering=%v filter=%q entries=%v", m.filtering, m.panels[0].filter, entryNames(m.panels[0].entries))
+	}
+}
+
+func TestFilterClearsOnDirectoryNavigation(t *testing.T) {
+	m := New(Config{})
+	m.panels[0].entries = []Entry{
+		{Name: "logs/", Path: "logs/", IsDir: true},
+		{Name: "data/", Path: "data/", IsDir: true},
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	for _, r := range "log" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m = updated.(Model)
+
+	if cmd == nil || m.panels[0].location != "logs/" {
+		t.Fatalf("right should enter filtered directory, location=%q cmd nil=%v", m.panels[0].location, cmd == nil)
+	}
+	if m.filtering || m.panels[0].filter != "" {
+		t.Fatalf("filter should clear on navigation, filtering=%v filter=%q", m.filtering, m.panels[0].filter)
+	}
+}
+
 func TestRenderPanelUsesRequestedOuterWidth(t *testing.T) {
 	m := New(Config{})
 	m.panels[0].entries = []Entry{{
@@ -884,6 +1018,57 @@ func TestOpenRemoteParentSelectsPreviousPrefix(t *testing.T) {
 	entry, ok := m.panels[0].current()
 	if !ok || entry.Path != "logs/2026/" {
 		t.Fatalf("selected entry = %#v, want logs/2026/", entry)
+	}
+}
+
+func TestReenterDirectoryRestoresPreviousSelection(t *testing.T) {
+	m := New(Config{})
+	m.panels[0].entries = []Entry{{Name: "logs/", Path: "logs/", IsDir: true}}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m = updated.(Model)
+	if cmd == nil || m.panels[0].location != "logs/" {
+		t.Fatalf("right should enter directory, location=%q cmd nil=%v", m.panels[0].location, cmd == nil)
+	}
+
+	childEntries := []Entry{
+		{Name: "..", Path: "", IsDir: true, parent: true},
+		{Name: "2025/", Path: "logs/2025/", IsDir: true},
+		{Name: "2026/", Path: "logs/2026/", IsDir: true},
+	}
+	updated, _ = m.Update(entriesLoadedMsg{index: 0, entries: childEntries})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	entry, ok := m.panels[0].current()
+	if !ok || entry.Path != "logs/2026/" {
+		t.Fatalf("selected entry before leaving = %#v, want logs/2026/", entry)
+	}
+
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m = updated.(Model)
+	if cmd == nil || m.panels[0].location != "" {
+		t.Fatalf("left should return to root, location=%q cmd nil=%v", m.panels[0].location, cmd == nil)
+	}
+	updated, _ = m.Update(entriesLoadedMsg{
+		index:   0,
+		entries: []Entry{{Name: "logs/", Path: "logs/", IsDir: true}},
+	})
+	m = updated.(Model)
+
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m = updated.(Model)
+	if cmd == nil || m.panels[0].location != "logs/" {
+		t.Fatalf("right should re-enter directory, location=%q cmd nil=%v", m.panels[0].location, cmd == nil)
+	}
+	updated, _ = m.Update(entriesLoadedMsg{index: 0, entries: childEntries})
+	m = updated.(Model)
+
+	entry, ok = m.panels[0].current()
+	if !ok || entry.Path != "logs/2026/" {
+		t.Fatalf("restored entry = %#v, want logs/2026/", entry)
 	}
 }
 

@@ -24,6 +24,21 @@ type Config struct {
 	TokenFile      string
 	Scope          string
 	UserFlow       bool
+
+	// Prompt, when non-nil, receives interactive sign-in instructions (device
+	// code details or the browser-flow URL) instead of writing them to stderr.
+	// The TUI sets this to render the instructions inside the alt-screen.
+	Prompt func(AuthPrompt)
+}
+
+// AuthPrompt carries the human-facing instructions for an interactive sign-in so
+// a caller (e.g. the TUI) can render them however it likes.
+type AuthPrompt struct {
+	Kind            string // "device" or "browser"
+	Message         string // ready-to-display instruction text
+	VerificationURL string // URL the user should open
+	UserCode        string // device-code the user must enter (device flow only)
+	QRCode          string // pre-rendered ASCII QR for VerificationURL (may be empty)
 }
 
 func (c Config) Normalize() Config {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -46,27 +47,31 @@ func (c scpConfig) label() string {
 }
 
 // scpSession owns the live ssh and sftp clients. A pointer to it is stored on
-// the panel so that bubbletea's value copies of the model share one connection.
+// the scpProvider so that bubbletea's value copies of the model share one
+// connection.
 type scpSession struct {
-	ssh   *ssh.Client
-	sftp  *sftp.Client
-	label string
+	ssh       *ssh.Client
+	sftp      *sftp.Client
+	label     string
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (s *scpSession) Close() error {
 	if s == nil {
 		return nil
 	}
-	var err error
-	if s.sftp != nil {
-		err = s.sftp.Close()
-	}
-	if s.ssh != nil {
-		if cerr := s.ssh.Close(); err == nil {
-			err = cerr
+	s.closeOnce.Do(func() {
+		if s.sftp != nil {
+			s.closeErr = s.sftp.Close()
 		}
-	}
-	return err
+		if s.ssh != nil {
+			if cerr := s.ssh.Close(); s.closeErr == nil {
+				s.closeErr = cerr
+			}
+		}
+	})
+	return s.closeErr
 }
 
 // connectSCP dials the host and opens an sftp session. It also resolves the
@@ -243,6 +248,8 @@ type scpProvider struct {
 
 func (p scpProvider) client() *sftp.Client { return p.session.sftp }
 
+func (p scpProvider) Close() error { return p.session.Close() }
+
 func (p scpProvider) Label() string {
 	if p.session != nil {
 		return p.session.label
@@ -361,7 +368,11 @@ func (p scpProvider) Create(_ context.Context, target string, _ int64, r io.Read
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, r); err != nil {
+	// ReadFromWithConcurrency pipelines many in-flight writes (like native scp)
+	// instead of one round-trip per 32KB packet. A plain io.Copy/ReadFrom only
+	// pipelines when the source reports its size, which the progressReader
+	// wrapper does not; passing concurrency 0 selects the client default.
+	if _, err := f.ReadFromWithConcurrency(r, 0); err != nil {
 		_ = f.Close()
 		_ = p.client().Remove(target)
 		return err

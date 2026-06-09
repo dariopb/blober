@@ -10,6 +10,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	azure_storage "github.com/dariopb/blober/pkg/azure_storage"
 )
 
 func entryNames(entries []Entry) []string {
@@ -80,8 +81,20 @@ func TestTabSwitchesActivePanel(t *testing.T) {
 	}
 }
 
+// newRemoteModel builds a model whose left pane is an Azure (remote) pane.
+// The TUI now starts both panes local, so tests that exercise remote/Azure
+// behavior opt in explicitly through this helper.
+func newRemoteModel(cfg Config) Model {
+	m := New(cfg)
+	p := newRemotePanel(cfg.Prefix)
+	p.provider = azureProvider{container: cfg.Container, accountName: cfg.AccountName}
+	m.panels[0] = p
+	m.azurePanel = 0
+	return m
+}
+
 func TestStatusBarShowsHelpShortcut(t *testing.T) {
-	m := New(Config{})
+	m := newRemoteModel(Config{})
 	if m.status != helpHint {
 		t.Fatalf("status = %q, want help shortcut only", m.status)
 	}
@@ -123,9 +136,10 @@ func TestOneOpensHelpModal(t *testing.T) {
 
 func TestContainerModalSelectsContainer(t *testing.T) {
 	m := New(Config{AccountName: "acct"})
+	m.showingContainers = true
 	m.containers = []string{"alpha", "beta"}
 	if !m.showingContainers {
-		t.Fatal("expected startup container picker when no container is configured")
+		t.Fatal("expected container picker")
 	}
 
 	got := m.View()
@@ -299,7 +313,7 @@ func TestExpandLocalDirectoryCopySources(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := New(Config{})
-	items, err := m.expandCopySources(context.Background(), panel{kind: LocalPanel}, []Entry{{Name: "dir/", Path: dir, IsDir: true}})
+	items, err := m.expandCopySources(context.Background(), panel{provider: localProvider{}}, []Entry{{Name: "dir/", Path: dir, IsDir: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +652,7 @@ func TestLoadThemeFileRejectsNonRGBColors(t *testing.T) {
 }
 
 func TestViewIncludesHeaderAndFitsWidth(t *testing.T) {
-	m := New(Config{AccountName: "acct123", Container: "data", Prefix: "logs/"})
+	m := newRemoteModel(Config{AccountName: "acct123", Container: "data", Prefix: "logs/"})
 	m.width = 60
 	m.height = 20
 	m.panels[0].entries = []Entry{{Name: "remote.txt", Path: "logs/remote.txt", Size: 10}}
@@ -656,7 +670,7 @@ func TestViewIncludesHeaderAndFitsWidth(t *testing.T) {
 }
 
 func TestViewUsesExactScreenGeometry(t *testing.T) {
-	m := New(Config{AccountName: "acct123", Container: "data", Prefix: "logs/"})
+	m := newRemoteModel(Config{AccountName: "acct123", Container: "data", Prefix: "logs/"})
 	m.width = 60
 	m.height = 20
 	m.panels[0].entries = []Entry{{Name: "remote.txt", Path: "logs/remote.txt", Size: 10}}
@@ -850,7 +864,7 @@ func TestPageHomeEndNavigation(t *testing.T) {
 }
 
 func TestLeftRightNavigation(t *testing.T) {
-	m := New(Config{})
+	m := newRemoteModel(Config{})
 	m.panels[0].entries = []Entry{{Name: "dir/", Path: "logs/", IsDir: true}}
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRight})
@@ -930,7 +944,7 @@ func TestNewDirectoryModalArrowSelectsCancel(t *testing.T) {
 }
 
 func TestNewRemoteDirectoryDoesNotCreatePlaceholderBlob(t *testing.T) {
-	m := New(Config{Prefix: "logs/"})
+	m := newRemoteModel(Config{Prefix: "logs/"})
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	m = updated.(Model)
@@ -1022,7 +1036,7 @@ func TestOpenRemoteParentSelectsPreviousPrefix(t *testing.T) {
 }
 
 func TestReenterDirectoryRestoresPreviousSelection(t *testing.T) {
-	m := New(Config{})
+	m := newRemoteModel(Config{})
 	m.panels[0].entries = []Entry{{Name: "logs/", Path: "logs/", IsDir: true}}
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRight})
@@ -1080,7 +1094,7 @@ func TestEmptyEntryColumnsKeepSeparators(t *testing.T) {
 }
 
 func TestViewShowsProgressModal(t *testing.T) {
-	m := New(Config{})
+	m := newRemoteModel(Config{})
 	m.width = 80
 	m.height = 24
 	m.copying = true
@@ -1169,5 +1183,110 @@ func TestEscCancelsCopy(t *testing.T) {
 	}
 	if m.status != "cancelling copy..." {
 		t.Fatalf("status = %q, want cancelling copy...", m.status)
+	}
+}
+
+func TestNewStartsBothPanesLocal(t *testing.T) {
+	m := New(Config{})
+	for i, p := range m.panels {
+		if _, ok := m.resolveProvider(p).(localProvider); !ok {
+			t.Fatalf("panel %d provider = %T, want localProvider", i, m.resolveProvider(p))
+		}
+		if p.title != "Local" {
+			t.Fatalf("panel %d title = %q, want Local", i, p.title)
+		}
+	}
+	if m.showingContainers {
+		t.Fatal("no startup container picker expected without an Azure client")
+	}
+	if m.authenticating {
+		t.Fatal("should not be authenticating at startup")
+	}
+}
+
+func TestApplyAzureProviderValidatesFields(t *testing.T) {
+	m := New(Config{})
+
+	m.providerForm = providerForm{account: "BAD NAME", subscription: "sub"}
+	mm, cmd := m.applyAzureProvider(0)
+	got := mm.(Model)
+	if cmd != nil || got.authenticating {
+		t.Fatal("invalid account should not start sign-in")
+	}
+	if got.status == helpHint {
+		t.Fatalf("expected validation error status, got %q", got.status)
+	}
+
+	m.providerForm = providerForm{account: "validacct", subscription: ""}
+	mm, cmd = m.applyAzureProvider(0)
+	got = mm.(Model)
+	if cmd != nil || got.authenticating {
+		t.Fatal("missing subscription should not start sign-in")
+	}
+	if got.status != "subscription is required" {
+		t.Fatalf("status = %q, want subscription is required", got.status)
+	}
+}
+
+func TestApplyAzureProviderStartsSignIn(t *testing.T) {
+	m := New(Config{})
+	m.providerForm = providerForm{account: "validacct", subscription: "sub", tenant: "ten"}
+
+	mm, cmd := m.applyAzureProvider(0)
+	got := mm.(Model)
+	if cmd == nil {
+		t.Fatal("expected a sign-in command")
+	}
+	if !got.authenticating {
+		t.Fatal("expected authenticating state")
+	}
+	if got.azurePanel != 0 {
+		t.Fatalf("azurePanel = %d, want 0", got.azurePanel)
+	}
+	if got.authCh == nil || got.authCancel == nil {
+		t.Fatal("expected auth channel and cancel to be set")
+	}
+	if got.providerModal {
+		t.Fatal("provider modal should close when sign-in starts")
+	}
+	got.authCancel()
+}
+
+func TestApplyAzureLoginDoneIgnoresStaleGen(t *testing.T) {
+	m := New(Config{})
+	m.authenticating = true
+	m.authGen = 5
+	cancelled := false
+	mm, cmd := m.applyAzureLoginDone(azureLoginDoneMsg{
+		gen:    4,
+		cancel: func() { cancelled = true },
+	})
+	got := mm.(Model)
+	if cmd != nil {
+		t.Fatal("stale login result should not produce a command")
+	}
+	if !cancelled {
+		t.Fatal("stale login result should cancel its credential context")
+	}
+	if !got.authenticating {
+		t.Fatal("stale result should not clear the in-flight auth state")
+	}
+}
+
+func TestAuthModalRendersPrompt(t *testing.T) {
+	m := New(Config{})
+	m.width = 80
+	m.height = 24
+	m.authenticating = true
+	m.authPrompt = &azure_storage.AuthPrompt{
+		Message:         "Open the browser to sign in",
+		UserCode:        "ABCD-1234",
+		VerificationURL: "https://microsoft.com/devicelogin",
+	}
+	got := m.View()
+	for _, want := range []string{"Azure sign-in", "Open the browser to sign in", "ABCD-1234", "https://microsoft.com/devicelogin", "Esc to cancel"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("auth modal missing %q:\n%s", want, got)
+		}
 	}
 }

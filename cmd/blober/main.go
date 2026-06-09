@@ -25,8 +25,8 @@ func newCommand() *cli.Command {
 		Name:  "blober",
 		Usage: "authenticate to Azure Storage and list, upload, download, or browse blobs",
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "subscription", Usage: "Azure subscription ID", Sources: cli.EnvVars("AZURE_SUBSCRIPTION_ID"), Required: true},
-			&cli.StringFlag{Name: "account", Usage: "Azure Storage account name", Sources: cli.EnvVars("AZURE_STORAGE_ACCOUNT"), Required: true},
+			&cli.StringFlag{Name: "subscription", Usage: "Azure subscription ID", Sources: cli.EnvVars("AZURE_SUBSCRIPTION_ID")},
+			&cli.StringFlag{Name: "account", Usage: "Azure Storage account name", Sources: cli.EnvVars("AZURE_STORAGE_ACCOUNT")},
 			&cli.StringFlag{Name: "tenant", Usage: "Microsoft Entra tenant ID", Sources: cli.EnvVars("AZURE_TENANT_ID")},
 			&cli.StringFlag{Name: "client-id", Usage: "OAuth client ID", Sources: cli.EnvVars("AZURE_CLIENT_ID")},
 			&cli.StringFlag{Name: "token-file", Usage: "token cache path", Sources: cli.EnvVars("AZURE_STORAGE_TOKEN_FILE")},
@@ -205,23 +205,23 @@ func tuiCommand() *cli.Command {
 			if err != nil {
 				return err
 			}
+			// Azure is no longer required to start the TUI: both panes open on the
+			// local filesystem and sign-in happens lazily when the user switches a
+			// pane to Azure in the provider modal. The command-line Azure values are
+			// passed through only as defaults to pre-fill that modal.
 			cfg := buildConfig(cmd)
-			cred, err := azure_storage.Login(ctx, cfg)
-			if err != nil {
-				return err
-			}
-			client, err := azure_storage.NewBlobServiceClient(cred, cfg)
-			if err != nil {
-				return err
-			}
 			model := tui.New(tui.Config{
-				Client:      client,
-				AccountName: cfg.AccountName,
-				Container:   container,
-				Prefix:      prefix,
-				LocalPath:   localPath,
-				Force:       cmd.Bool("force"),
-				Theme:       theme,
+				AccountName:    cfg.AccountName,
+				SubscriptionID: cfg.SubscriptionID,
+				TenantID:       cmd.String("tenant"),
+				ClientID:       cmd.String("client-id"),
+				TokenFile:      cmd.String("token-file"),
+				UserFlow:       cmd.Bool("user-flow"),
+				Container:      container,
+				Prefix:         prefix,
+				LocalPath:      localPath,
+				Force:          cmd.Bool("force"),
+				Theme:          theme,
 			})
 			_, err = tea.NewProgram(model, tea.WithAltScreen()).Run()
 			return err

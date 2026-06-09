@@ -29,6 +29,15 @@ type Config struct {
 	LocalPath   string
 	Force       bool
 	Theme       Theme
+
+	// Azure sign-in defaults. The TUI starts on the local filesystem and only
+	// authenticates when the user switches a pane to Azure, so these are used to
+	// pre-fill the provider modal rather than to connect at startup.
+	SubscriptionID string
+	TenantID       string
+	ClientID       string
+	TokenFile      string
+	UserFlow       bool
 }
 
 const helpHint = "1 -> help"
@@ -39,6 +48,19 @@ type Model struct {
 	container   string
 	force       bool
 	theme       Theme
+
+	// azureDefaults holds the connection parameters (subscription/tenant/client
+	// id/token file/user flow) used to pre-fill the Azure provider modal and to
+	// build the sign-in Config. azureCred caches the credential from a successful
+	// in-TUI sign-in; azureCredCancel stops its background refresh loop and is
+	// cancelled when the credential is replaced.
+	azureDefaults   azureParams
+	azureCred       azcore.TokenCredential
+	azureCredCancel context.CancelFunc
+	azurePanel      int
+	// azureConnectedTenant records the tenant that produced the current client so
+	// the credential is only reused when the identity matches.
+	azureConnectedTenant string
 
 	panels           [2]panel
 	active           int
@@ -85,12 +107,18 @@ type Model struct {
 
 	providerModal      bool
 	providerModalPanel int
-	providerType       PanelKind
+	providerType       providerKind
 	providerField      int
 	providerButton     int
-	providerForm       scpConfig
+	providerForm       providerForm
 	providerCursor     int
 	connecting         bool
+
+	authenticating bool
+	authPrompt     *azure_storage.AuthPrompt
+	authCh         chan tea.Msg
+	authCancel     context.CancelFunc
+	authGen        uint64
 
 	keyBrowse        bool
 	keyBrowseDir     string
@@ -207,12 +235,30 @@ type entriesLoadedMsg struct {
 }
 
 type providerConnectedMsg struct {
-	index   int
+	index    int
+	gen      uint64
+	provider Provider
+	root     string
+	label    string
+	err      error
+}
+
+// authPromptMsg delivers interactive sign-in instructions from the login
+// goroutine to the model so they can be rendered. gen discriminates against a
+// superseded or cancelled sign-in.
+type authPromptMsg struct {
+	gen    uint64
+	prompt azure_storage.AuthPrompt
+}
+
+// azureLoginDoneMsg reports the result of an in-TUI Azure sign-in.
+type azureLoginDoneMsg struct {
 	gen     uint64
-	kind    PanelKind
-	session *scpSession
-	root    string
-	label   string
+	panel   int
+	account string
+	tenant  string
+	cred    azcore.TokenCredential
+	cancel  context.CancelFunc
 	err     error
 }
 
@@ -261,6 +307,16 @@ type containersLoadedMsg struct {
 	err        error
 }
 
+// azureParams holds the Azure connection parameters gathered from the command
+// line and/or the provider modal.
+type azureParams struct {
+	subscription string
+	tenant       string
+	clientID     string
+	tokenFile    string
+	userFlow     bool
+}
+
 func New(cfg Config) Model {
 	theme := normalizeTheme(cfg.Theme)
 	applyTheme(theme)
@@ -278,8 +334,15 @@ func New(cfg Config) Model {
 		container:   cfg.Container,
 		force:       cfg.Force,
 		theme:       theme,
+		azureDefaults: azureParams{
+			subscription: cfg.SubscriptionID,
+			tenant:       cfg.TenantID,
+			clientID:     cfg.ClientID,
+			tokenFile:    cfg.TokenFile,
+			userFlow:     cfg.UserFlow,
+		},
 		panels: [2]panel{
-			newRemotePanel(cfg.Prefix),
+			newLocalPanel(localPath),
 			newLocalPanel(localPath),
 		},
 		containerButton: -1,
@@ -290,41 +353,37 @@ func New(cfg Config) Model {
 			{},
 		},
 	}
-	if m.container == "" && (m.accountName != "" || m.client != nil) {
-		m.showingContainers = true
-		m.status = "select a container"
+	// A client may be supplied directly (e.g. by tests); in that case keep the
+	// historical behavior of opening the left pane on Azure. The normal CLI path
+	// passes no client and both panes start local until the user picks Azure.
+	if m.client != nil {
+		m.panels[0] = newRemotePanel(cfg.Prefix)
+		m.panels[0].provider = m.makeAzureProvider()
+		if m.container == "" {
+			m.showingContainers = true
+			m.status = "select a container"
+		}
 	}
-	m.panels[0].provider = m.makeAzureProvider()
 	m.providerModalPanel = -1
 	return m
 }
 
 func (m Model) makeAzureProvider() Provider {
-	return azureProvider{client: m.client, container: m.container}
+	return azureProvider{client: m.client, container: m.container, accountName: m.accountName}
 }
 
-// resolveProvider returns the panel's provider, falling back to a kind-derived
-// provider for panels constructed without one (used by tests).
+// resolveProvider returns the panel's provider, defaulting to a local provider
+// for panels constructed without one (used by tests).
 func (m Model) resolveProvider(p panel) Provider {
 	if p.provider != nil {
 		return p.provider
 	}
-	switch p.kind {
-	case RemotePanel:
-		return m.makeAzureProvider()
-	case SCPPanel:
-		if p.scp != nil {
-			return scpProvider{session: p.scp}
-		}
-		return localProvider{}
-	default:
-		return localProvider{}
-	}
+	return localProvider{}
 }
 
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.listCmd(1)}
-	if m.container == "" {
+	if m.client != nil && m.container == "" {
 		cmds = append(cmds, m.listContainersCmd())
 	} else {
 		cmds = append(cmds, m.listCmd(0))
@@ -338,6 +397,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 	case tea.KeyMsg:
+		if m.authenticating {
+			switch msg.String() {
+			case "ctrl+c":
+				if m.authCancel != nil {
+					m.authCancel()
+				}
+				return m, tea.Quit
+			case "esc":
+				if m.authCancel != nil {
+					m.authCancel()
+				}
+				m.authenticating = false
+				m.authPrompt = nil
+				m.authCh = nil
+				m.authCancel = nil
+				m.authGen++ // invalidate any in-flight prompt/result messages
+				m.status = "sign-in cancelled"
+			}
+			return m, nil
+		}
 		if m.showingContainers {
 			switch msg.String() {
 			case "ctrl+c", "q":
@@ -536,6 +615,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			return m, m.listCmd(m.active)
 		case "l":
+			if _, ok := m.panels[m.active].provider.(azureProvider); !ok {
+				m.status = "container list is only available for an Azure remote"
+				return m, nil
+			}
+			m.azurePanel = m.active
 			m.showingContainers = true
 			m.containerButton = -1
 			return m, m.listContainersCmd()
@@ -576,6 +660,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case providerConnectedMsg:
 		return m.applyProviderConnected(msg)
+	case authPromptMsg:
+		if !m.authenticating || m.authCh == nil || msg.gen != m.authGen {
+			return m, nil
+		}
+		p := msg.prompt
+		m.authPrompt = &p
+		m.status = "complete sign-in to continue"
+		return m, waitAuth(m.authCh)
+	case azureLoginDoneMsg:
+		return m.applyAzureLoginDone(msg)
 	case containersLoadedMsg:
 		m.containers = msg.containers
 		m.containerErr = msg.err
@@ -670,6 +764,9 @@ func (m Model) View() string {
 	if m.creatingDir {
 		return renderScreen(overlayCentered(base, m.renderNewDirModal(), screenWidth, screenHeight), screenWidth, screenHeight)
 	}
+	if m.authenticating {
+		return renderScreen(overlayCentered(base, m.renderAuthModal(), screenWidth, screenHeight), screenWidth, screenHeight)
+	}
 	if m.showingContainers {
 		return renderScreen(overlayCentered(base, m.renderContainerModal(), screenWidth, screenHeight), screenWidth, screenHeight)
 	}
@@ -694,26 +791,15 @@ func (m Model) View() string {
 
 func (m Model) headerText() string {
 	remote := m.panels[0]
-	if remote.kind != RemotePanel {
-		location := remote.location
-		if location == "" {
-			location = "(root)"
-		}
-		return fmt.Sprintf("%s: %s", m.resolveProvider(remote).Label(), location)
+	prov := m.resolveProvider(remote)
+	if d, ok := prov.(headerDescriber); ok {
+		return d.Header(remote.location)
 	}
-	account := m.accountName
-	if account == "" {
-		account = "(unknown account)"
+	location := remote.location
+	if location == "" {
+		location = "(root)"
 	}
-	prefix := remote.location
-	if prefix == "" {
-		prefix = "(root)"
-	}
-	container := m.container
-	if container == "" {
-		container = "(select container)"
-	}
-	return fmt.Sprintf("Remote: account=%s container=%s prefix=%s", account, container, prefix)
+	return fmt.Sprintf("%s: %s", prov.Label(), location)
 }
 
 func (m Model) footerText() string {
@@ -1397,6 +1483,55 @@ func (m *Model) moveCursor(delta int) {
 	m.moveCursorTo(p.cursor + delta)
 }
 
+// applyAzureLoginDone consumes the result of an in-TUI Azure sign-in: on success
+// it builds the blob client, takes ownership of the credential refresh loop, and
+// switches the target pane to Azure. Stale or cancelled results are discarded.
+func (m Model) applyAzureLoginDone(msg azureLoginDoneMsg) (tea.Model, tea.Cmd) {
+	if msg.gen != m.authGen || !m.authenticating {
+		// Superseded or cancelled sign-in; stop its credential refresh loop.
+		if msg.cancel != nil {
+			msg.cancel()
+		}
+		return m, nil
+	}
+	m.authenticating = false
+	m.authPrompt = nil
+	m.authCh = nil
+	m.authCancel = nil
+	if msg.err != nil {
+		if msg.cancel != nil {
+			msg.cancel()
+		}
+		if errors.Is(msg.err, context.Canceled) {
+			m.status = "sign-in cancelled"
+		} else {
+			m.status = "sign-in failed: " + msg.err.Error()
+		}
+		return m, nil
+	}
+	client, err := azure_storage.NewBlobServiceClient(msg.cred, azure_storage.Config{
+		SubscriptionID: m.azureDefaults.subscription,
+		AccountName:    msg.account,
+	})
+	if err != nil {
+		if msg.cancel != nil {
+			msg.cancel()
+		}
+		m.status = "sign-in failed: " + err.Error()
+		return m, nil
+	}
+	// Replace any previous credential and stop its background refresh loop.
+	if m.azureCredCancel != nil {
+		m.azureCredCancel()
+	}
+	m.client = client
+	m.accountName = msg.account
+	m.azureConnectedTenant = msg.tenant
+	m.azureCred = msg.cred
+	m.azureCredCancel = msg.cancel
+	return m.switchPaneToAzure(msg.panel, "signed in to Azure")
+}
+
 func (m *Model) moveContainerCursor(delta int) {
 	if len(m.containers) == 0 {
 		m.containerButton = 0
@@ -1425,12 +1560,18 @@ func (m Model) selectContainer() (Model, tea.Cmd) {
 		return m, nil
 	}
 	m.container = m.containers[m.containerCursor]
-	m.panels[0] = newRemotePanel("")
-	m.panels[0].provider = m.makeAzureProvider()
+	idx := m.azurePanel
+	if idx < 0 || idx >= len(m.panels) {
+		idx = 0
+	}
+	gen := m.panels[idx].gen + 1
+	m.panels[idx] = newRemotePanel("")
+	m.panels[idx].gen = gen
+	m.panels[idx].provider = m.makeAzureProvider()
 	m.showingContainers = false
 	m.containerButton = -1
 	m.status = "selected container " + m.container
-	return m, m.listCmd(0)
+	return m, m.listCmd(idx)
 }
 
 func (m *Model) moveCursorTo(index int) {
@@ -1976,7 +2117,9 @@ func (m Model) copyCmd(ctx context.Context, sourceIndex int, items []copyItem, o
 				close(progressCh)
 				return copyDoneMsg{source: sourceIndex, err: err}
 			}
-			batchDone += item.entry.Size
+			if item.entry.Size > 0 {
+				batchDone += item.entry.Size
+			}
 		}
 		close(progressCh)
 		return copyDoneMsg{source: sourceIndex}
@@ -2001,6 +2144,9 @@ func (m Model) copyOne(ctx context.Context, srcProv, dstProv Provider, targetLoc
 	if size < 0 {
 		size = item.entry.Size
 	}
+	if size < 0 {
+		size = 0
+	}
 	report(0, size)
 	reader := &progressReader{ctx: ctx, r: rc, report: func(done int64) { report(done, size) }}
 	createErr := dstProv.Create(ctx, dst, size, reader)
@@ -2015,7 +2161,11 @@ func (m Model) copyOne(ctx context.Context, srcProv, dstProv Provider, targetLoc
 	if closeErr != nil {
 		return closeErr
 	}
-	report(size, size)
+	// Only emit a "complete" total when the size was known; otherwise leave the
+	// progress at the bytes actually streamed to avoid a misleading 100%/0%.
+	if size > 0 {
+		report(size, size)
+	}
 	return nil
 }
 
@@ -2161,6 +2311,16 @@ func waitProgress(ch <-chan tea.Msg) tea.Cmd {
 	}
 }
 
+func waitAuth(ch <-chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return msg
+	}
+}
+
 func totalSize(entries []Entry) int64 {
 	var total int64
 	for _, entry := range entries {
@@ -2172,7 +2332,9 @@ func totalSize(entries []Entry) int64 {
 func totalCopySize(items []copyItem) int64 {
 	var total int64
 	for _, item := range items {
-		total += item.entry.Size
+		if item.entry.Size > 0 {
+			total += item.entry.Size
+		}
 	}
 	return total
 }

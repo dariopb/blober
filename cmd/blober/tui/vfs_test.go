@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,20 +26,14 @@ func TestSafeRelRejectsTraversal(t *testing.T) {
 	}
 }
 
-func TestResolveProviderByKind(t *testing.T) {
+func TestResolveProviderDefaultsToLocal(t *testing.T) {
 	m := New(Config{})
-	if _, ok := m.resolveProvider(panel{kind: LocalPanel}).(localProvider); !ok {
-		t.Fatalf("LocalPanel did not resolve to localProvider")
+	// A panel without an explicit provider resolves to localProvider.
+	if _, ok := m.resolveProvider(panel{}).(localProvider); !ok {
+		t.Fatalf("empty panel did not resolve to localProvider")
 	}
-	if _, ok := m.resolveProvider(panel{kind: RemotePanel}).(azureProvider); !ok {
-		t.Fatalf("RemotePanel did not resolve to azureProvider")
-	}
-	// SCPPanel without a live session falls back to local.
-	if _, ok := m.resolveProvider(panel{kind: SCPPanel}).(localProvider); !ok {
-		t.Fatalf("SCPPanel without session did not fall back to localProvider")
-	}
-	// An explicit provider on the panel wins over the kind fallback.
-	p := panel{kind: LocalPanel, provider: azureProvider{}}
+	// An explicit provider on the panel is honored.
+	p := panel{provider: azureProvider{}}
 	if _, ok := m.resolveProvider(p).(azureProvider); !ok {
 		t.Fatalf("explicit provider was not honored")
 	}
@@ -119,7 +114,6 @@ func TestLocalToLocalCopyViaCopyCmd(t *testing.T) {
 	}
 	m := New(Config{})
 	// Pane 1 (right) is the source; pane 0 is the destination.
-	m.panels[0].kind = LocalPanel
 	m.panels[0].provider = localProvider{}
 	m.panels[0].location = dstDir
 	m.panels[1].location = srcDir
@@ -165,15 +159,12 @@ func TestProviderModalOpensAndSwitchesToLocal(t *testing.T) {
 		t.Fatalf("modal view missing title:\n%s", view)
 	}
 
-	// Cycle the type selector to Local (start kind is RemotePanel for pane 0).
-	m.providerType = LocalPanel
+	// Cycle the type selector to Local (start type is Azure for pane 0).
+	m.providerType = kindLocal
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)
 	if m.providerModal {
 		t.Fatal("modal should close after selecting Local")
-	}
-	if m.panels[0].kind != LocalPanel {
-		t.Fatalf("pane 0 kind = %v, want LocalPanel", m.panels[0].kind)
 	}
 	if _, ok := m.panels[0].provider.(localProvider); !ok {
 		t.Fatalf("pane 0 provider = %T, want localProvider", m.panels[0].provider)
@@ -188,7 +179,7 @@ func TestProviderModalScpValidation(t *testing.T) {
 	m.active = 1
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
 	m = updated.(Model)
-	m.providerType = SCPPanel
+	m.providerType = kindSCP
 
 	// No host/user yet: Connect should report validation error, modal stays open.
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -225,10 +216,10 @@ func TestProviderModalScpConnectsWithoutPasswordOrKey(t *testing.T) {
 	m.active = 1
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
 	m = updated.(Model)
-	m.providerType = SCPPanel
+	m.providerType = kindSCP
 	// Host and user only; no password and no key -> should fall back to the
 	// user's ~/.ssh credentials and begin connecting rather than erroring.
-	m.providerForm = scpConfig{host: "h", port: "22", user: "u"}
+	m.providerForm = providerForm{host: "h", port: "22", user: "u"}
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)
@@ -261,7 +252,7 @@ func TestKeyBrowserNavigatesAndSelectsFile(t *testing.T) {
 	m.active = 1
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
 	m = updated.(Model)
-	m.providerType = SCPPanel
+	m.providerType = kindSCP
 	m.providerField = providerFieldKey
 	// Seed the browser to start in tmp by pointing the key path inside it.
 	m.providerForm.keyPath = filepath.Join(tmp, "placeholder")
@@ -309,7 +300,7 @@ func TestProviderModalCursorEditing(t *testing.T) {
 	m.active = 1
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
 	m = updated.(Model)
-	m.providerType = SCPPanel
+	m.providerType = kindSCP
 	m.providerField = providerFieldHost
 	m.providerCursorToEnd()
 
@@ -385,7 +376,7 @@ func TestProviderSwitchClearsStaleEntries(t *testing.T) {
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
 	m = updated.(Model)
-	m.providerType = LocalPanel
+	m.providerType = kindLocal
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)
 
@@ -402,8 +393,8 @@ func TestScpConnectCancelInvalidatesInflight(t *testing.T) {
 	m.active = 1
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
 	m = updated.(Model)
-	m.providerType = SCPPanel
-	m.providerForm = scpConfig{host: "h", port: "22", user: "u", pass: "p"}
+	m.providerType = kindSCP
+	m.providerForm = providerForm{host: "h", port: "22", user: "u", pass: "p"}
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)
@@ -422,15 +413,92 @@ func TestScpConnectCancelInvalidatesInflight(t *testing.T) {
 	// A late successful connection arrives carrying the stale generation; it
 	// must be discarded rather than switching the pane to SCP.
 	updated, _ = m.Update(providerConnectedMsg{
-		index:   1,
-		gen:     staleGen,
-		kind:    SCPPanel,
-		session: &scpSession{label: "scp u@h"},
-		root:    "/home/u",
-		label:   "scp u@h",
+		index:    1,
+		gen:      staleGen,
+		provider: scpProvider{session: &scpSession{label: "scp u@h"}},
+		root:     "/home/u",
+		label:    "scp u@h",
 	})
 	m = updated.(Model)
-	if m.panels[1].kind == SCPPanel {
+	if _, ok := m.panels[1].provider.(scpProvider); ok {
 		t.Fatal("stale connection was applied after cancel")
+	}
+}
+
+// writerToReader is a reader that also implements io.WriterTo, standing in for a
+// concurrent source such as *sftp.File so the progressReader fast path can be
+// exercised without a live server.
+type writerToReader struct {
+	data     []byte
+	wroteVia string // "writeto" if WriteTo was used, "read" otherwise
+}
+
+func (w *writerToReader) Read(b []byte) (int, error) {
+	if len(w.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(b, w.data)
+	w.data = w.data[n:]
+	w.wroteVia = "read"
+	return n, nil
+}
+
+func (w *writerToReader) WriteTo(dst io.Writer) (int64, error) {
+	w.wroteVia = "writeto"
+	n, err := dst.Write(w.data)
+	w.data = w.data[n:]
+	return int64(n), err
+}
+
+func TestProgressReaderUsesWriteToFastPath(t *testing.T) {
+	payload := []byte("the quick brown fox jumps over the lazy dog")
+	src := &writerToReader{data: append([]byte(nil), payload...)}
+	var reported int64
+	pr := &progressReader{ctx: context.Background(), r: src, report: func(done int64) { reported = done }}
+
+	var dst strings.Builder
+	n, err := io.Copy(&dst, pr) // io.Copy prefers src.WriteTo
+	if err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if src.wroteVia != "writeto" {
+		t.Fatalf("fast path not used: source consumed via %q", src.wroteVia)
+	}
+	if n != int64(len(payload)) || dst.String() != string(payload) {
+		t.Fatalf("copied %d bytes %q, want %d %q", n, dst.String(), len(payload), payload)
+	}
+	if reported != int64(len(payload)) {
+		t.Fatalf("progress reported %d, want %d", reported, len(payload))
+	}
+}
+
+// plainReader implements only Read (no WriteTo), forcing the fallback path.
+type plainReader struct{ data []byte }
+
+func (p *plainReader) Read(b []byte) (int, error) {
+	if len(p.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(b, p.data)
+	p.data = p.data[n:]
+	return n, nil
+}
+
+func TestProgressReaderFallbackCountsBytes(t *testing.T) {
+	payload := []byte("hello fallback world")
+	pr := &progressReader{ctx: context.Background(), r: &plainReader{data: append([]byte(nil), payload...)}}
+	var reported int64
+	pr.report = func(done int64) { reported = done }
+
+	var dst strings.Builder
+	n, err := io.Copy(&dst, pr)
+	if err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if n != int64(len(payload)) || dst.String() != string(payload) {
+		t.Fatalf("copied %d %q, want %d %q", n, dst.String(), len(payload), payload)
+	}
+	if reported != int64(len(payload)) {
+		t.Fatalf("progress reported %d, want %d", reported, len(payload))
 	}
 }

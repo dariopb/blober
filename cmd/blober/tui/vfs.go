@@ -56,6 +56,16 @@ type Provider interface {
 	Create(ctx context.Context, p string, size int64, r io.Reader) error
 	// Walk expands a directory entry into a flat list of files.
 	Walk(ctx context.Context, entry Entry) ([]WalkItem, error)
+	// Close releases any resources held by the provider (e.g. an ssh/sftp
+	// connection). Stateless backends return nil.
+	Close() error
+}
+
+// headerDescriber is an optional interface a Provider may implement to render a
+// custom header line (used by the Azure backend to show account/container). When
+// a provider does not implement it, the header falls back to "Label: location".
+type headerDescriber interface {
+	Header(location string) string
 }
 
 // safeRel rejects relative paths that could escape the destination root.
@@ -101,6 +111,69 @@ func (pr *progressReader) Read(b []byte) (int, error) {
 	}
 	return n, err
 }
+
+// WriteTo lets io.Copy pick a concurrent fast path when the wrapped reader
+// supports one. Without it, io.Copy of an sftp download would fall back to the
+// destination's ReadFrom, which calls Read in a sequential 32KB loop (one
+// network round-trip per chunk) and runs ~20x slower than the pipelined
+// transfer that sftp.File.WriteTo performs. io.Copy consults src.WriteTo before
+// dst.ReadFrom, so implementing this here is enough to engage the fast path.
+func (pr *progressReader) WriteTo(w io.Writer) (int64, error) {
+	if err := pr.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if wt, ok := pr.r.(io.WriterTo); ok {
+		n, err := wt.WriteTo(progressWriter{pr: pr, w: w})
+		// If the fast path failed before transferring anything (e.g. a server
+		// that rejects the stat sftp.File.WriteTo issues), retry sequentially so
+		// the copy still succeeds, just slower. A partial transfer (n>0) is not
+		// retried to avoid duplicating bytes.
+		if err != nil && n == 0 {
+			return pr.copyFallback(w)
+		}
+		return n, err
+	}
+	return pr.copyFallback(w)
+}
+
+// copyFallback performs a plain buffered copy that still reports progress via
+// Read. The onlyReader/onlyWriter wrappers hide the WriteTo/ReadFrom methods so
+// io.Copy cannot recurse back into the fast path.
+func (pr *progressReader) copyFallback(w io.Writer) (int64, error) {
+	return io.Copy(onlyWriter{w}, onlyReader{pr})
+}
+
+// progressWriter counts bytes as they are written by a delegated WriteTo and
+// honors context cancellation. WriteTo serializes writes on a single goroutine,
+// so the counter needs no synchronization.
+type progressWriter struct {
+	pr *progressReader
+	w  io.Writer
+}
+
+func (pw progressWriter) Write(b []byte) (int, error) {
+	if err := pw.pr.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := pw.w.Write(b)
+	if n > 0 {
+		pw.pr.done += int64(n)
+		if pw.pr.report != nil {
+			pw.pr.report(pw.pr.done)
+		}
+	}
+	return n, err
+}
+
+// onlyReader and onlyWriter expose just Read/Write so io.Copy does not detect a
+// WriterTo/ReaderFrom and recurse into a fast path.
+type onlyReader struct{ r io.Reader }
+
+func (o onlyReader) Read(b []byte) (int, error) { return o.r.Read(b) }
+
+type onlyWriter struct{ w io.Writer }
+
+func (o onlyWriter) Write(b []byte) (int, error) { return o.w.Write(b) }
 
 // localProvider is the local filesystem backend.
 type localProvider struct{}
@@ -226,14 +299,38 @@ func (localProvider) Walk(_ context.Context, entry Entry) ([]WalkItem, error) {
 	return items, err
 }
 
+func (localProvider) Close() error { return nil }
+
 // azureProvider is the Azure Blob Storage backend. It is built from the model's
 // client and the currently selected container.
 type azureProvider struct {
-	client    *azblob.Client
-	container string
+	client      *azblob.Client
+	container   string
+	accountName string
 }
 
 func (azureProvider) Label() string { return "Azure" }
+
+// Close is a no-op: the azblob client is shared, owned by the Model, and must
+// not be closed when a pane switches away from Azure.
+func (azureProvider) Close() error { return nil }
+
+// Header renders the Azure-specific header line (account/container/prefix).
+func (p azureProvider) Header(location string) string {
+	account := p.accountName
+	if account == "" {
+		account = "(unknown account)"
+	}
+	prefix := location
+	if prefix == "" {
+		prefix = "(root)"
+	}
+	container := p.container
+	if container == "" {
+		container = "(select container)"
+	}
+	return fmt.Sprintf("Remote: account=%s container=%s prefix=%s", account, container, prefix)
+}
 
 func (p azureProvider) List(ctx context.Context, location string) ([]Entry, error) {
 	if p.container == "" {

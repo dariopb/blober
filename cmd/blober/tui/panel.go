@@ -12,12 +12,16 @@ import (
 	azure_storage "github.com/dariopb/blober/pkg/azure_storage"
 )
 
-type PanelKind int
+// providerKind identifies a storage backend type in the provider modal's type
+// selector. It is not stored on a panel; panels hold a Provider directly.
+type providerKind int
 
 const (
-	LocalPanel PanelKind = iota
-	RemotePanel
-	SCPPanel
+	kindLocal providerKind = iota
+	kindAzure
+	kindSCP
+	kindHTTP
+	kindWebDAV
 )
 
 type Entry struct {
@@ -30,9 +34,7 @@ type Entry struct {
 }
 
 type panel struct {
-	kind       PanelKind
 	provider   Provider
-	scp        *scpSession
 	gen        uint64
 	title      string
 	location   string
@@ -46,11 +48,11 @@ type panel struct {
 }
 
 func newLocalPanel(path string) panel {
-	return panel{kind: LocalPanel, provider: localProvider{}, title: "Local", location: path, selected: map[string]Entry{}}
+	return panel{provider: localProvider{}, title: "Local", location: path, selected: map[string]Entry{}}
 }
 
 func newRemotePanel(prefix string) panel {
-	return panel{kind: RemotePanel, title: "Remote", location: prefix, selected: map[string]Entry{}}
+	return panel{title: "Remote", location: prefix, selected: map[string]Entry{}}
 }
 
 func (p panel) current() (Entry, bool) {

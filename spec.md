@@ -170,8 +170,8 @@ Global flags:
 
 | Flag             | Env var                    | Required | Description |
 |------------------|----------------------------|----------|-------------|
-| `--subscription` | `AZURE_SUBSCRIPTION_ID`    | yes      | Azure subscription ID. |
-| `--account`      | `AZURE_STORAGE_ACCOUNT`    | yes      | Storage account name. |
+| `--subscription` | `AZURE_SUBSCRIPTION_ID`    | blob cmds | Azure subscription ID. Required by `blob` subcommands; for `tui` it only pre-fills the Azure provider modal. |
+| `--account`      | `AZURE_STORAGE_ACCOUNT`    | blob cmds | Storage account name. Required by `blob` subcommands; for `tui` it only pre-fills the Azure provider modal. |
 | `--tenant`       | `AZURE_TENANT_ID`          | no       | Entra tenant; default `common`. |
 | `--client-id`    | `AZURE_CLIENT_ID`          | no       | OAuth client ID. |
 | `--token-file`   | `AZURE_STORAGE_TOKEN_FILE` | no       | Token cache path. |
@@ -224,16 +224,20 @@ download complete: 4194304 bytes in 340ms (11.76 MB/s overall)
 ### `tui`
 
 Starts an interactive Midnight Commander-style terminal UI built with
-Charm Bubble Tea. The UI has two side-by-side panels:
+Charm Bubble Tea. The UI has two side-by-side panels. Azure is optional: the
+TUI **always starts with both panels on the local filesystem** and performs no
+authentication at startup. Any Azure connection (and its OAuth sign-in) happens
+on demand through the `p` provider modal, which is pre-filled from the
+`--account`/`--subscription`/`--tenant` command-line values when present. Each
+panel can independently point at any provider (Local, Azure, SCP, HTTP, WebDAV):
 
-- **Header**: a single top line showing remote context, including storage
-  account, container, and current remote prefix.
-- **Remote panel**: Azure Blob Storage contents for `--container` rooted at
-  `--prefix` if provided. If `--container` is omitted, the TUI lists
-  accessible containers and shows a modal picker before loading the remote
-  panel.
-- **Local panel**: the current working directory by default, or the path
+- **Header**: a single top line showing the active panel's context. For an Azure
+  panel this includes storage account, container, and current remote prefix.
+- **Local panels**: the current working directory by default, or the path
   provided by `--local-path`.
+- **Azure panel**: after connecting through the modal, lists Azure Blob Storage
+  contents for the chosen container rooted at `--prefix` if provided. When no
+  container is selected yet, a modal container picker is shown first.
 
 Flags:
 
@@ -334,20 +338,22 @@ Behavior:
   the TUI.
 - `r` refreshes the active panel.
 - `p` opens a fixed-size centered modal to choose the storage provider for the
-  active panel: Local filesystem, Azure Blob Storage, or SCP (ssh/sftp). The
-  Type row cycles with the left/right arrows. Selecting SCP reveals Host, Port,
-  User, Password, and Key file fields. A host and user are required; if both
-  Password and Key file are left empty, the connection falls back to the user's
-  default SSH credentials (ssh-agent and the standard `~/.ssh` keys). Pressing
-  Enter on the Key file field opens a directory browser (starting in the key's
-  directory, otherwise `~/.ssh`) to navigate and pick a private key.
-  Local and Azure switch the panel immediately; SCP dials the host
-  asynchronously and shows a connecting state with `Esc` to cancel. The modal
-  has GUI-style Connect and Cancel buttons. The SCP text fields are editable
-  with a visible block cursor: left/right move the cursor within the field,
-  Home/End jump to the start/end, typing inserts at the cursor, Backspace
-  deletes the character before it, and Delete removes the character at it. See
-  `vfs_providers.md` for the underlying VFS provider abstraction and SCP
+  active panel: Local filesystem, Azure Blob Storage, SCP (ssh/sftp), plain HTTP,
+  or WebDAV. The Type row cycles with the left/right arrows. Selecting SCP reveals
+  Host, Port, User, Password, and Key file fields. A host and user are required;
+  if both Password and Key file are left empty, the connection falls back to the
+  user's default SSH credentials (ssh-agent and the standard `~/.ssh` keys).
+  Pressing Enter on the Key file field opens a directory browser (starting in the
+  key's directory, otherwise `~/.ssh`) to navigate and pick a private key.
+  Selecting HTTP or WebDAV reveals URL, User and Password fields; the URL is
+  required and optional credentials are sent as HTTP Basic auth. Local and Azure
+  switch the panel immediately; SCP, HTTP and WebDAV connect asynchronously and
+  show a connecting state with `Esc` to cancel. The modal has GUI-style Connect
+  and Cancel buttons. The text fields are editable with a visible block cursor:
+  left/right move the cursor within the field, Home/End jump to the start/end,
+  typing inserts at the cursor, Backspace deletes the character before it, and
+  Delete removes the character at it. See `vfs_providers.md` for the underlying
+  VFS provider abstraction, the HTTP/WebDAV providers, and SCP
   connection/known-hosts behavior.
 - `q`, `Esc`, or `Ctrl+C` exits the TUI.
 - The bottom status line shows the active panel, currently highlighted file,

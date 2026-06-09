@@ -95,8 +95,16 @@ func runBrowserFlow(ctx context.Context, client *http.Client, cfg Config) (Cache
 	defer server.Shutdown(context.Background())
 
 	authURL := authorizationURL(cfg, redirectURI, state, pkceChallenge(verifier))
-	fmt.Fprintf(authOutput, "Listening for OAuth redirect at %s\n", redirectURI)
-	fmt.Fprintf(authOutput, "Opening browser for login: %s\n", authURL)
+	if cfg.Prompt != nil {
+		cfg.Prompt(AuthPrompt{
+			Kind:            "browser",
+			Message:         "Complete sign-in in the browser window that just opened.",
+			VerificationURL: authURL,
+		})
+	} else {
+		fmt.Fprintf(authOutput, "Listening for OAuth redirect at %s\n", redirectURI)
+		fmt.Fprintf(authOutput, "Opening browser for login: %s\n", authURL)
+	}
 	if err := openBrowserFunc(authURL); err != nil {
 		return CachedToken{}, err
 	}
@@ -178,8 +186,42 @@ func runDeviceFlow(ctx context.Context, client *http.Client, cfg Config) (Cached
 	if err != nil {
 		return CachedToken{}, err
 	}
-	writeDeviceFlowInstructions(os.Stderr, device)
+	if cfg.Prompt != nil {
+		cfg.Prompt(buildDevicePrompt(device))
+	} else {
+		writeDeviceFlowInstructions(os.Stderr, device)
+	}
 	return pollDeviceCode(ctx, client, cfg, device)
+}
+
+// buildDevicePrompt renders the device-code instructions (including an ASCII QR
+// code) into an AuthPrompt for callers that display sign-in details themselves.
+func buildDevicePrompt(device oauth.DeviceCodeResponse) AuthPrompt {
+	authURL := deviceAuthURL(device)
+	message := device.Message
+	if message == "" {
+		message = fmt.Sprintf("Open %s and enter code %s", device.VerificationURI, device.UserCode)
+	}
+	var qr strings.Builder
+	if authURL != "" {
+		qrterminal.GenerateWithConfig(authURL, qrterminal.Config{
+			Level:          qrterminal.L,
+			Writer:         &qr,
+			HalfBlocks:     true,
+			BlackChar:      qrterminal.BLACK_BLACK,
+			WhiteBlackChar: qrterminal.WHITE_BLACK,
+			WhiteChar:      qrterminal.WHITE_WHITE,
+			BlackWhiteChar: qrterminal.BLACK_WHITE,
+			QuietZone:      1,
+		})
+	}
+	return AuthPrompt{
+		Kind:            "device",
+		Message:         message,
+		VerificationURL: authURL,
+		UserCode:        device.UserCode,
+		QRCode:          qr.String(),
+	}
 }
 
 func writeDeviceFlowInstructions(w io.Writer, device oauth.DeviceCodeResponse) {

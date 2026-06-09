@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1287,6 +1288,54 @@ func TestAuthModalRendersPrompt(t *testing.T) {
 	for _, want := range []string{"Azure sign-in", "Open the browser to sign in", "ABCD-1234", "https://microsoft.com/devicelogin", "Esc to cancel"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("auth modal missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestConnectionErrorOpensErrorModal(t *testing.T) {
+	m := New(Config{})
+	m.providerModalPanel = 1
+	m.providerModal = true
+	m.connecting = true
+	m.panels[1].gen = 3
+
+	longErr := "ssh: handshake failed: knownhosts: key mismatch and a lot of extra detail that would be truncated in the status bar but should appear in full inside the error modal"
+	updated, cmd := m.Update(providerConnectedMsg{index: 1, gen: 3, err: errors.New(longErr)})
+	m = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("expected no command on error, got one")
+	}
+	if !m.errorModal {
+		t.Fatal("expected error modal to open")
+	}
+	if m.providerModal {
+		t.Fatal("provider modal should be hidden while the error modal is shown")
+	}
+	if m.connecting {
+		t.Fatal("connecting should be cleared")
+	}
+	m.width, m.height = 80, 24
+	view := m.View()
+	if !strings.Contains(view, "Connection failed") || !strings.Contains(view, "key mismatch") {
+		t.Fatalf("error modal should show the full message:\n%s", view)
+	}
+
+	// Dismiss returns to the provider modal.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.errorModal {
+		t.Fatal("error modal should close on Esc")
+	}
+	if !m.providerModal {
+		t.Fatal("provider modal should reopen after dismissing the error")
+	}
+}
+
+func TestWrapTextHardBreaksLongTokens(t *testing.T) {
+	lines := wrapText("https://averylongurl.example.com/segment/that/exceeds/the/width", 10)
+	for _, l := range lines {
+		if lipgloss.Width(l) > 10 {
+			t.Fatalf("line %q exceeds width 10", l)
 		}
 	}
 }

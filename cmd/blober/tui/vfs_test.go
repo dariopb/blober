@@ -502,3 +502,30 @@ func TestProgressReaderFallbackCountsBytes(t *testing.T) {
 		t.Fatalf("progress reported %d, want %d", reported, len(payload))
 	}
 }
+
+func TestSCPAddressStripsHiddenRunes(t *testing.T) {
+	cases := map[string]string{
+		"10.137.200.71\r":     "10.137.200.71:22",
+		"10.137.200.71\u200b": "10.137.200.71:22",
+		"\ufeff10.137.200.71": "10.137.200.71:22",
+		" dario\n":            "dario:22",
+	}
+	for host, want := range cases {
+		cfg := scpConfig{host: host}
+		if got := cfg.address(); got != want {
+			t.Fatalf("address(%q) = %q, want %q", host, got, want)
+		}
+	}
+}
+
+func TestInsertProviderRunesDropsControlAndFormatRunes(t *testing.T) {
+	m := New(Config{})
+	m.providerType = kindSCP
+	m.providerButton = -1
+	m.providerField = providerFieldHost
+	m.insertProviderRunes([]rune("10.137.200.71\r"))
+	m.insertProviderRunes([]rune{'\u200b'})
+	if m.providerForm.host != "10.137.200.71" {
+		t.Fatalf("host = %q, want clean IP", m.providerForm.host)
+	}
+}

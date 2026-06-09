@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -30,20 +33,37 @@ type scpConfig struct {
 	root    string
 }
 
+// cleanHost normalizes a host string for dialing. Besides trimming surrounding
+// whitespace it strips any control or Unicode "format" runes (a stray carriage
+// return, BOM, zero-width space, etc. that can ride along on a pasted value).
+// Such hidden characters stop a literal IP from parsing and turn an otherwise
+// valid hostname into one the resolver rejects, surfacing on Windows as
+// "lookup <host>: invalid argument".
+func cleanHost(h string) string {
+	h = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, h)
+	return strings.TrimSpace(h)
+}
+
 func (c scpConfig) address() string {
-	port := strings.TrimSpace(c.port)
+	port := cleanHost(c.port)
 	if port == "" {
 		port = "22"
 	}
-	return net.JoinHostPort(strings.TrimSpace(c.host), port)
+	return net.JoinHostPort(cleanHost(c.host), port)
 }
 
 func (c scpConfig) label() string {
+	host := cleanHost(c.host)
 	user := strings.TrimSpace(c.user)
 	if user == "" {
-		return "scp " + strings.TrimSpace(c.host)
+		return "scp " + host
 	}
-	return fmt.Sprintf("scp %s@%s", user, strings.TrimSpace(c.host))
+	return fmt.Sprintf("scp %s@%s", user, host)
 }
 
 // scpSession owns the live ssh and sftp clients. A pointer to it is stored on
@@ -77,7 +97,7 @@ func (s *scpSession) Close() error {
 // connectSCP dials the host and opens an sftp session. It also resolves the
 // starting directory (defaulting to the remote working directory).
 func connectSCP(cfg scpConfig) (*scpSession, string, error) {
-	if strings.TrimSpace(cfg.host) == "" {
+	if cleanHost(cfg.host) == "" {
 		return nil, "", errors.New("host is required")
 	}
 	if strings.TrimSpace(cfg.user) == "" {
@@ -120,6 +140,14 @@ func connectSCP(cfg scpConfig) (*scpSession, string, error) {
 		Auth:            auths,
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         15 * time.Second,
+	}
+	// When we already trust a host key for this server, advertise its
+	// algorithm(s) so the server presents that key type. Otherwise the Go
+	// client may negotiate a different host-key type than the one stored,
+	// which knownhosts reports as a "key mismatch" even though the host is
+	// the one we trust. OpenSSH does the same reordering implicitly.
+	if algos := knownHostKeyAlgorithms(hostKeyCallback, cfg.address()); len(algos) > 0 {
+		clientConfig.HostKeyAlgorithms = algos
 	}
 
 	sshClient, err := ssh.Dial("tcp", cfg.address(), clientConfig)
@@ -224,6 +252,49 @@ func hostKeyCallback() (ssh.HostKeyCallback, error) {
 		}
 		return err
 	}, nil
+}
+
+// knownHostKeyAlgorithms returns the host-key algorithms we already trust for
+// the given address in known_hosts, so they can be advertised during the SSH
+// handshake. The known_hosts database is probed with a throwaway key: a
+// resulting KeyError carries the trusted keys for the host, whose types we map
+// to negotiable algorithms (expanding ssh-rsa to its rsa-sha2 variants). When
+// the host is unknown the result is empty so first-use (TOFU) still works.
+func knownHostKeyAlgorithms(cb ssh.HostKeyCallback, address string) []string {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		return nil
+	}
+	// db.check requires a parseable remote address; the hostname in `address`
+	// takes precedence for the actual lookup.
+	remote := &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	var keyErr *knownhosts.KeyError
+	if err := cb(address, remote, signer.PublicKey()); !errors.As(err, &keyErr) || len(keyErr.Want) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var algos []string
+	add := func(a string) {
+		if a != "" && !seen[a] {
+			seen[a] = true
+			algos = append(algos, a)
+		}
+	}
+	for _, known := range keyErr.Want {
+		switch known.Key.Type() {
+		case ssh.KeyAlgoRSA:
+			add(ssh.KeyAlgoRSASHA256)
+			add(ssh.KeyAlgoRSASHA512)
+			add(ssh.KeyAlgoRSA)
+		default:
+			add(known.Key.Type())
+		}
+	}
+	return algos
 }
 
 func appendKnownHost(knownHostsPath, hostname string, remote net.Addr, key ssh.PublicKey) error {

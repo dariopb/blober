@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -294,6 +295,20 @@ func (m *Model) insertProviderRunes(runes []rune) {
 	if p == nil {
 		return
 	}
+	// Drop control and Unicode "format" runes (stray \r, BOM, zero-width
+	// spaces, etc.) that can ride along on a pasted value and corrupt a host
+	// or URL, leading to "lookup <host>: invalid argument" failures.
+	filtered := runes[:0:0]
+	for _, c := range runes {
+		if unicode.IsControl(c) || unicode.Is(unicode.Cf, c) {
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	runes = filtered
+	if len(runes) == 0 {
+		return
+	}
 	r := []rune(*p)
 	if m.providerCursor < 0 {
 		m.providerCursor = 0
@@ -513,8 +528,7 @@ func (m Model) applyProviderConnected(msg providerConnectedMsg) (tea.Model, tea.
 	}
 	m.connecting = false
 	if msg.err != nil {
-		m.status = "connection failed: " + msg.err.Error()
-		return m, nil
+		return m.showProviderError("Connection failed", msg.err.Error()), nil
 	}
 	m.providerModal = false
 	m.closePanelSession(msg.index)
@@ -764,6 +778,118 @@ func (m Model) renderAuthModal() string {
 		fullWidthStyle(modalRowStyle, contentWidth).Render("Esc to cancel"),
 	)
 	return m.frameProviderModal(width, lines)
+}
+
+// showProviderError pops up a modal showing the full error text from a failed
+// provider connection or Azure sign-in. Dismissing it returns to the provider
+// modal so the user can adjust the connection parameters and retry.
+func (m Model) showProviderError(title, text string) Model {
+	if strings.TrimSpace(title) == "" {
+		title = "Error"
+	}
+	m.errorModal = true
+	m.errorTitle = title
+	m.errorText = strings.TrimSpace(text)
+	m.errorReturnToProvider = true
+	// Hide any modal currently underneath so only the error shows; it is
+	// restored on dismissal.
+	m.providerModal = false
+	m.connecting = false
+	m.authenticating = false
+	m.status = title
+	return m
+}
+
+// dismissErrorModal closes the error modal and, when appropriate, reopens the
+// provider modal that triggered the failed connection.
+func (m Model) dismissErrorModal() Model {
+	m.errorModal = false
+	m.errorTitle = ""
+	m.errorText = ""
+	if m.errorReturnToProvider {
+		m.errorReturnToProvider = false
+		if m.providerModalPanel >= 0 && m.providerModalPanel < len(m.panels) {
+			m.providerModal = true
+			m.status = "select provider for active pane"
+		}
+	}
+	return m
+}
+
+// renderErrorModal renders the full (word-wrapped) error text with a dismiss
+// hint, sized to the available screen width.
+func (m Model) renderErrorModal(screenWidth int) string {
+	contentWidth := 56
+	if screenWidth > 8 {
+		if max := screenWidth - modalStyle.GetHorizontalFrameSize() - 4; max < contentWidth {
+			contentWidth = max
+		}
+	}
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+	width := contentWidth + modalStyle.GetHorizontalFrameSize()
+
+	title := m.errorTitle
+	if title == "" {
+		title = "Error"
+	}
+	lines := []string{
+		fullWidthStyle(modalTitleStyle, contentWidth).Render(truncate(title, contentWidth)),
+		fullWidthStyle(modalRowStyle, contentWidth).Render(""),
+	}
+	for _, line := range wrapText(m.errorText, contentWidth) {
+		lines = append(lines, fullWidthStyle(modalRowStyle, contentWidth).Render(truncate(line, contentWidth)))
+	}
+	lines = append(lines,
+		fullWidthStyle(modalRowStyle, contentWidth).Render(""),
+		fullWidthStyle(modalRowStyle, contentWidth).Render("[ Esc / Enter to dismiss ]"),
+	)
+	return m.frameProviderModal(width, lines)
+}
+
+// wrapText word-wraps s to the given width, preserving explicit newlines and
+// hard-breaking any single token longer than the width.
+func wrapText(s string, width int) []string {
+	if width < 1 {
+		width = 1
+	}
+	var out []string
+	for _, paragraph := range strings.Split(s, "\n") {
+		words := strings.Fields(paragraph)
+		if len(words) == 0 {
+			out = append(out, "")
+			continue
+		}
+		line := ""
+		for _, word := range words {
+			for lipgloss.Width(word) > width {
+				if line != "" {
+					out = append(out, line)
+					line = ""
+				}
+				runes := []rune(word)
+				out = append(out, string(runes[:width]))
+				word = string(runes[width:])
+			}
+			switch {
+			case line == "":
+				line = word
+			case lipgloss.Width(line)+1+lipgloss.Width(word) <= width:
+				line += " " + word
+			default:
+				out = append(out, line)
+				line = word
+			}
+		}
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, "")
+	}
+	return out
 }
 
 func (m Model) frameProviderModal(width int, lines []string) string {

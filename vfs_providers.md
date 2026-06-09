@@ -247,6 +247,10 @@ The connection never uses `InsecureIgnoreHostKey`.
   client or starts an in-TUI sign-in; once connected it opens the container
   picker when no container is selected. SCP, HTTP and WebDAV connect
   asynchronously, showing a connecting state that `Esc` cancels.
+- When a connection or Azure sign-in fails, the full error is shown in a
+  dedicated, word-wrapped error modal (the status bar would truncate it).
+  Dismissing it with `Esc`/`Enter` returns to the provider modal with the
+  entered values intact so the connection can be adjusted and retried.
 
 ### Azure sign-in
 

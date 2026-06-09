@@ -120,6 +120,11 @@ type Model struct {
 	authCancel     context.CancelFunc
 	authGen        uint64
 
+	errorModal            bool
+	errorTitle            string
+	errorText             string
+	errorReturnToProvider bool
+
 	keyBrowse        bool
 	keyBrowseDir     string
 	keyBrowseEntries []Entry
@@ -397,6 +402,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 	case tea.KeyMsg:
+		if m.errorModal {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc", "enter", "q", " ":
+				m = m.dismissErrorModal()
+			}
+			return m, nil
+		}
 		if m.authenticating {
 			switch msg.String() {
 			case "ctrl+c":
@@ -755,6 +769,9 @@ func (m Model) View() string {
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 	status := m.renderFooter(screenWidth)
 	base := lipgloss.JoinVertical(lipgloss.Left, header, body, status)
+	if m.errorModal {
+		return renderScreen(overlayCentered(base, m.renderErrorModal(screenWidth), screenWidth, screenHeight), screenWidth, screenHeight)
+	}
 	if m.copying {
 		return renderScreen(overlayCentered(base, m.renderProgressModal(), screenWidth, screenHeight), screenWidth, screenHeight)
 	}
@@ -1504,10 +1521,9 @@ func (m Model) applyAzureLoginDone(msg azureLoginDoneMsg) (tea.Model, tea.Cmd) {
 		}
 		if errors.Is(msg.err, context.Canceled) {
 			m.status = "sign-in cancelled"
-		} else {
-			m.status = "sign-in failed: " + msg.err.Error()
+			return m, nil
 		}
-		return m, nil
+		return m.showProviderError("Azure sign-in failed", msg.err.Error()), nil
 	}
 	client, err := azure_storage.NewBlobServiceClient(msg.cred, azure_storage.Config{
 		SubscriptionID: m.azureDefaults.subscription,
@@ -1517,8 +1533,7 @@ func (m Model) applyAzureLoginDone(msg azureLoginDoneMsg) (tea.Model, tea.Cmd) {
 		if msg.cancel != nil {
 			msg.cancel()
 		}
-		m.status = "sign-in failed: " + err.Error()
-		return m, nil
+		return m.showProviderError("Azure sign-in failed", err.Error()), nil
 	}
 	// Replace any previous credential and stop its background refresh loop.
 	if m.azureCredCancel != nil {

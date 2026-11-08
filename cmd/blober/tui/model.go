@@ -71,10 +71,19 @@ type Model struct {
 	pendingSelectSet [2]bool
 	rememberedSelect [2]map[string]string
 
-	copying      bool
-	copyProgress transferProgress
-	progressCh   chan tea.Msg
-	copyCancel   context.CancelFunc
+	copying       bool
+	copyProgress  transferProgress
+	progressCh    chan tea.Msg
+	copyCancel    context.CancelFunc
+	transferLabel string
+
+	input            *actionInput
+	inputGen         uint64
+	showingBookmarks bool
+	bookmarks        []bookmark
+	bookmarkCursor   int
+	bookmarkButton   int
+	bookmarksPath    string
 
 	confirming         bool
 	confirmAction      confirmAction
@@ -87,6 +96,7 @@ type Model struct {
 	overwriteAt        int
 	overwriteBtn       int
 	showingHelp        bool
+	helpOffset         int
 	showingTheme       bool
 	themeCursor        int
 	themeDraft         string
@@ -230,6 +240,7 @@ const (
 	confirmCopy
 	confirmOverwrite
 	confirmDelete
+	confirmMove
 )
 
 type entriesLoadedMsg struct {
@@ -472,6 +483,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case "1", "esc", "q", "enter":
 				m.showingHelp = false
+			case "up", "k":
+				m.helpOffset = max(0, m.helpOffset-1)
+			case "down", "j":
+				m.helpOffset = min(max(0, len(keyboardHelp)-m.helpPageSize()), m.helpOffset+1)
+			case "pgup":
+				m.helpOffset = max(0, m.helpOffset-m.helpPageSize())
+			case "pgdown":
+				m.helpOffset = min(max(0, len(keyboardHelp)-m.helpPageSize()), m.helpOffset+m.helpPageSize())
+			case "home":
+				m.helpOffset = 0
+			case "end":
+				m.helpOffset = max(0, len(keyboardHelp)-m.helpPageSize())
 			}
 			return m, nil
 		}
@@ -524,6 +547,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.providerModal {
 			return m.updateProviderModal(msg)
+		}
+		if m.input != nil {
+			return m.updateActionInput(msg)
+		}
+		if m.showingBookmarks {
+			return m.updateBookmarks(msg)
 		}
 		if m.creatingDir {
 			if msg.Type == tea.KeyBackspace || msg.Type == tea.KeyCtrlH {
@@ -594,6 +623,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.copyCancel != nil {
 					m.copyCancel()
 					m.status = "cancelling copy..."
+					switch m.transferLabel {
+					case "Moving":
+						m.status = "cancelling move..."
+					case "Renaming":
+						m.status = "cancelling rename..."
+					}
 				}
 			}
 			return m, nil
@@ -606,6 +641,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "1":
 			m.showingHelp = true
+			m.helpOffset = 0
 		case "tab":
 			m.active = 1 - m.active
 		case "up", "k":
@@ -639,6 +675,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.listContainersCmd()
 		case "c":
 			return m.startCopy()
+		case "f2":
+			m.openRename()
+		case "m":
+			return m.startMove()
+		case "g":
+			m.openActionInput(inputLocation, m.panels[m.active].location)
+		case "b":
+			m.openBookmarks()
+		case "ctrl+b":
+			m.openActionInput(inputBookmark, "")
 		case "d":
 			return m.startDelete()
 		case "n":
@@ -672,6 +718,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.status = msg.err.Error()
 		}
+	case locationLoadedMsg:
+		return m.applyLocationLoaded(msg)
+	case fileActionDoneMsg:
+		return m.applyFileActionDone(msg)
 	case providerConnectedMsg:
 		return m.applyProviderConnected(msg)
 	case authPromptMsg:
@@ -799,6 +849,12 @@ func (m Model) View() string {
 			overlay = m.renderKeyBrowser()
 		}
 		return renderScreen(overlayCentered(base, overlay, screenWidth, screenHeight), screenWidth, screenHeight)
+	}
+	if m.input != nil {
+		return renderScreen(overlayCentered(base, m.renderActionInput(), screenWidth, screenHeight), screenWidth, screenHeight)
+	}
+	if m.showingBookmarks {
+		return renderScreen(overlayCentered(base, m.renderBookmarks(), screenWidth, screenHeight), screenWidth, screenHeight)
 	}
 	// base is already composed to exactly screenWidth x screenHeight with every
 	// cell painted (header, panels and status fill their own backgrounds), so the
@@ -1025,8 +1081,12 @@ func (m Model) renderProgressModal() string {
 	batchPercent := percent(p.BatchDone, p.BatchTotal)
 	const width = 52
 	contentWidth := width - modalStyle.GetHorizontalFrameSize()
+	title := m.transferLabel
+	if title == "" {
+		title = "Copying"
+	}
 	content := strings.Join([]string{
-		fullWidthStyle(modalTitleStyle, contentWidth).Render("Copying"),
+		fullWidthStyle(modalTitleStyle, contentWidth).Render(title),
 		fullWidthStyle(modalRowStyle, contentWidth).Render(truncate(p.File, contentWidth)),
 		fullWidthStyle(modalRowStyle, contentWidth).Render(fmt.Sprintf("File  %s %5.1f%%", progressBar(filePercent, 24), filePercent)),
 		fullWidthStyle(modalRowStyle, contentWidth).Render(fmt.Sprintf("%d/%d bytes", p.FileDone, p.FileTotal)),
@@ -1050,6 +1110,9 @@ func (m Model) renderConfirmModal() string {
 	title := "Confirm"
 	message := "Proceed?"
 	switch m.confirmAction {
+	case confirmMove:
+		title = "Confirm move"
+		message = fmt.Sprintf("Move %d item(s) to the other pane?", len(m.pendingCopy))
 	case confirmCopy:
 		title = "Confirm overwrite"
 		message = fmt.Sprintf("Overwrite existing targets if needed for %d file(s)?", len(m.pendingCopy))
@@ -1246,47 +1309,62 @@ func (m Model) renderContainerModal() string {
 		Render(strings.Join(lines, "\n"))
 }
 
-func (m Model) renderHelpModal() string {
-	const width = 76
-	contentWidth := width - modalStyle.GetHorizontalFrameSize()
-	lines := []string{
-		fullWidthStyle(modalTitleStyle, contentWidth).Render("Keyboard help"),
+var keyboardHelp = []struct {
+	key    string
+	action string
+}{
+	{"1", "show or close this help"},
+	{"Tab", "switch active panel"},
+	{"l", "list and switch containers"},
+	{"Up/Down or j/k", "move selection"},
+	{"PageUp/PageDown", "move by one page"},
+	{"Home/End", "move to first or last entry"},
+	{"Space", "toggle item selection"},
+	{"/", "filter active panel"},
+	{"Enter/Right", "open directory"},
+	{"Backspace/Left or h", "go to parent"},
+	{"c", "copy selected or highlighted item"},
+	{"F2", "rename highlighted item"},
+	{"m", "move selected or highlighted item"},
+	{"g", "go to directory or prefix"},
+	{"b / Ctrl+B", "open / save named bookmark"},
+	{"d", "delete selected or highlighted item"},
+	{"n", "create directory"},
+	{"p", "change provider (local/azure/scp/http/dav)"},
+	{"r", "refresh active panel"},
+	{"t", "edit theme"},
+	{"Esc/q/Ctrl+C", "quit or cancel modal"},
+}
+
+func (m Model) helpPageSize() int {
+	height := m.height
+	if height <= 0 {
+		height = 24
 	}
-	for _, item := range []struct {
-		key    string
-		action string
-	}{
-		{"1", "show or close this help"},
-		{"Tab", "switch active panel"},
-		{"l", "list and switch containers"},
-		{"Up/Down or j/k", "move selection"},
-		{"PageUp/PageDown", "move by one page"},
-		{"Home/End", "move to first or last entry"},
-		{"Space", "toggle item selection"},
-		{"/", "filter active panel"},
-		{"Enter/Right", "open directory"},
-		{"Backspace/Left or h", "go to parent"},
-		{"c", "copy selected or highlighted item"},
-		{"d", "delete selected or highlighted item"},
-		{"n", "create directory"},
-		{"p", "change pane provider (local/azure/scp)"},
-		{"r", "refresh active panel"},
-		{"t", "edit theme"},
-		{"Esc/q/Ctrl+C", "quit or cancel modal"},
-	} {
+	return max(1, height-modalStyle.GetVerticalFrameSize()-3)
+}
+
+func (m Model) renderHelpModal() string {
+	width := 76
+	if m.width > 0 {
+		width = min(width, max(12, m.width-4))
+	}
+	contentWidth := max(1, width-modalStyle.GetHorizontalFrameSize())
+	lines := []string{
+		fullWidthStyle(modalTitleStyle, contentWidth).Render(truncate("Keyboard help (Up/Down to scroll)", contentWidth)),
+	}
+	start := min(m.helpOffset, max(0, len(keyboardHelp)-m.helpPageSize()))
+	for _, item := range keyboardHelp[start:min(len(keyboardHelp), start+m.helpPageSize())] {
 		line := fmt.Sprintf("%-20s %s", item.key, item.action)
-		lines = append(lines, fullWidthStyle(modalRowStyle, contentWidth).Render(line))
+		lines = append(lines, fullWidthStyle(modalRowStyle, contentWidth).Render(truncate(line, contentWidth)))
 	}
 	lines = append(lines,
 		fullWidthStyle(modalRowStyle, contentWidth).Render(""),
 		renderSingleDialogButton(contentWidth, "Close"),
 	)
-	height := len(lines) + modalStyle.GetVerticalFrameSize() + modalStyle.GetVerticalPadding()
 	return modalStyle.
 		Width(width - modalStyle.GetHorizontalBorderSize()).
-		Height(height - modalStyle.GetVerticalBorderSize()).
 		MaxWidth(width).
-		MaxHeight(height).
 		Render(strings.Join(lines, "\n"))
 }
 
@@ -1876,6 +1954,7 @@ func (m Model) beginCopyItemsWithCancel(ctx context.Context, cancel context.Canc
 		return m, nil
 	}
 	m.copying = true
+	m.transferLabel = ""
 	m.copyProgress = transferProgress{File: items[0].targetRel, BatchTotal: totalCopySize(items)}
 	m.progressCh = make(chan tea.Msg, 32)
 	m.copyCancel = cancel
@@ -1932,6 +2011,8 @@ func (m Model) createDirectory() (Model, tea.Cmd) {
 func (m Model) acceptConfirmation() (Model, tea.Cmd) {
 	m.confirming = false
 	switch m.confirmAction {
+	case confirmMove:
+		return m.beginMove(m.pendingSource, m.pendingCopy)
 	case confirmCopy:
 		if !m.force {
 			return m.checkOverwriteConflicts(m.pendingSource, m.pendingCopy)
@@ -1955,6 +2036,8 @@ func (m *Model) cancelConfirmation() {
 	m.clearConfirmation()
 	if action == confirmDelete {
 		m.status = "delete cancelled"
+	} else if action == confirmMove {
+		m.status = "move cancelled"
 	} else {
 		m.status = "copy cancelled"
 	}

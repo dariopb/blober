@@ -48,6 +48,17 @@ to render a custom panel header; Azure uses it to show account/container/prefix.
 Providers that don't implement it fall back to a generic `Label: location`
 header.
 
+Providers may also implement the optional `renamer` interface:
+`Rename(context.Context, source, target string) error`. Local, SFTP and WebDAV
+use native rename (WebDAV sends `MOVE` with `Overwrite: F`). The model checks
+destination conflicts and rejects self/descendant moves before execution.
+Cross-provider moves and Azure renames use the shared streaming copy/delete
+path. It enumerates the source tree, preserves empty directories where the
+target supports them, and removes a source item only after its complete tree
+has transferred successfully. A failure keeps that source intact, without
+rolling back previously moved items. Copy/delete moves reject symlinks/special
+files and unrepresentable empty directories rather than silently losing them.
+
 Semantics:
 
 - `Label` is a short human-readable backend identity used in panel headers.

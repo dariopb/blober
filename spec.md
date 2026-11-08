@@ -337,6 +337,28 @@ Behavior:
 - Existing targets are not overwritten unless the user confirms the overwrite in
   the TUI.
 - `r` refreshes the active panel.
+- `F2` prompts for a new single-segment name for the highlighted item. `m`
+  confirms a move of the selection (or highlighted item) to the inactive pane.
+  Both reject existing destinations regardless of `--force`. Native
+  local/SFTP/WebDAV rename is used where possible; otherwise each source item
+  is copied completely before being deleted. Failure/cancellation keeps the
+  current item's source, but does not roll back previously completed items.
+  Copy/delete moves reject symlinks, special files, and empty directories that
+  the target cannot represent.
+- `g` opens an editable path prompt. Local paths support `~`; Local/SFTP/web
+  paths can be relative to the current directory. Azure prefixes are rooted at
+  the container. Web paths cannot leave the configured origin/root. Listing is
+  asynchronous and the pane location changes only on success. `Esc` cancels;
+  late results are discarded.
+- `Ctrl+B` saves a named bookmark of the active connection and location in
+  `blober/bookmarks.json` under the OS user configuration directory. Names are
+  unique, writes are atomic, and passwords/tokens/private-key contents are
+  never stored. `b` opens the picker, Enter opens a bookmark, and Delete removes
+  it. Remote bookmarks restore the provider form without passwords for review
+  before connecting. Azure bookmarks include account, subscription, tenant,
+  container and prefix; SCP bookmarks include host, port, user and key path.
+  HTTP/WebDAV bookmarks include root URL, username and directory. URLs with
+  credentials, query strings or fragments are rejected.
 - `p` opens a fixed-size centered modal to choose the storage provider for the
   active panel: Local filesystem, Azure Blob Storage, SCP (ssh/sftp), plain HTTP,
   or WebDAV. The Type row cycles with the left/right arrows. Selecting SCP reveals
@@ -359,6 +381,8 @@ Behavior:
 - The bottom status line shows the active panel, currently highlighted file,
   and full byte size, plus errors or informational messages when present.
   Status output must not corrupt the terminal.
+- Keyboard help scrolls with Up/Down, PageUp/PageDown and Home/End when it is
+  taller than the terminal; the Close button remains visible.
 - `t` shows a fixed-size centered editable theme modal listing the current
   named color values in `#RRGGBB` format. Arrow keys or `j`/`k` select a color
   row, and the active editable row is visibly marked. Typing a hex digit starts

@@ -25,6 +25,8 @@ type providerForm struct {
 	account      string
 	subscription string
 	tenant       string
+	location     string
+	container    string
 }
 
 // providerField identifies the editable rows of the provider modal.
@@ -120,6 +122,10 @@ func (m *Model) openProviderModal() {
 		account:      m.accountName,
 		subscription: m.azureDefaults.subscription,
 		tenant:       m.azureDefaults.tenant,
+	}
+	if saved := m.panels[m.active].connection; saved != (providerForm{}) {
+		m.providerForm = saved
+		m.providerForm.location = ""
 	}
 	m.providerCursor = 0
 	m.keyBrowse = false
@@ -232,6 +238,8 @@ func (m *Model) cycleProviderType(delta int) {
 	}
 	idx = (idx + delta + len(order)) % len(order)
 	m.providerType = order[idx]
+	m.providerForm.location = ""
+	m.providerForm.container = ""
 	// Field sets differ per type; return to the Type row to stay valid.
 	m.providerField = providerFieldType
 	m.providerCursorToEnd()
@@ -370,6 +378,7 @@ func (m Model) applyProvider() (tea.Model, tea.Cmd) {
 		m.closePanelSession(index)
 		p := &m.panels[index]
 		p.provider = localProvider{}
+		p.connection = providerForm{}
 		p.title = "Local"
 		p.location = localStartDir()
 		p.cursor, p.offset = 0, 0
@@ -390,7 +399,7 @@ func (m Model) applyProvider() (tea.Model, tea.Cmd) {
 			m.status = "user is required"
 			return m, nil
 		}
-		cfg := scpConfig{host: f.host, port: f.port, user: f.user, pass: f.pass, keyPath: f.keyPath}
+		cfg := scpConfig{host: f.host, port: f.port, user: f.user, pass: f.pass, keyPath: f.keyPath, root: f.location}
 		m.connecting = true
 		if f.pass == "" && strings.TrimSpace(f.keyPath) == "" {
 			m.status = "connecting to " + cfg.label() + " using ~/.ssh keys..."
@@ -410,7 +419,11 @@ func (m Model) applyProvider() (tea.Model, tea.Cmd) {
 		m.status = "connecting to " + strings.TrimSpace(f.url) + "..."
 		gen := m.panels[index].gen + 1
 		m.panels[index].gen = gen
-		return m, connectWebCmd(index, gen, m.providerType, f.url, f.user, f.pass)
+		cmd := connectWebCmd(index, gen, m.providerType, f.url, f.user, f.pass)
+		if f.location != "" {
+			cmd = connectBookmarkWebCmd(cmd, f.location)
+		}
+		return m, cmd
 	}
 	return m, nil
 }
@@ -481,10 +494,14 @@ func (m Model) switchPaneToAzure(index int, okStatus string) (tea.Model, tea.Cmd
 	}
 	m.azurePanel = index
 	m.closePanelSession(index)
+	if m.providerForm.container != "" {
+		m.container = m.providerForm.container
+	}
 	p := &m.panels[index]
 	p.provider = m.makeAzureProvider()
 	p.title = "Remote"
-	p.location = ""
+	p.location = m.providerForm.location
+	p.connection = m.providerForm
 	p.cursor, p.offset = 0, 0
 	p.gen++
 	m.resetPanelContent(index)
@@ -534,6 +551,7 @@ func (m Model) applyProviderConnected(msg providerConnectedMsg) (tea.Model, tea.
 	m.closePanelSession(msg.index)
 	p := &m.panels[msg.index]
 	p.provider = msg.provider
+	p.connection = m.providerForm
 	p.title = msg.label
 	p.location = msg.root
 	p.cursor, p.offset = 0, 0

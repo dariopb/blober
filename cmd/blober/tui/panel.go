@@ -45,6 +45,7 @@ type panel struct {
 	offset     int
 	selected   map[string]Entry
 	err        error
+	connection providerForm
 }
 
 func newLocalPanel(path string) panel {

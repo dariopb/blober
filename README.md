@@ -14,7 +14,8 @@ See [`spec.md`](./spec.md) for the full design.
 
 ## Features
 
-- Device-code or browser (auth-code + PKCE) login against Microsoft Entra ID.
+- Reuse an existing Azure CLI (`az login`) session, with device-code or browser
+  (auth-code + PKCE) login against Microsoft Entra ID as a fallback.
 - Local token cache with automatic refresh (kept fresh in the background for
   long-lived processes such as the TUI).
 - `list`, `upload`, `download` blob commands with progress (bytes, %, MB/s).
@@ -70,9 +71,12 @@ All flags can also be provided via environment variables.
 | `--user-flow`    | —                           | Use browser auth-code + PKCE instead of device code |
 | `--verbose`      | —                           | Verbose logging                              |
 
-The first authenticated command will prompt you to sign in (device code by
-default, or browser if `--user-flow` is set). Subsequent commands reuse the
-cached token and refresh it as needed.
+Authenticated commands first reuse the app's cached token and refresh it as
+needed. If no usable cached token is available, they try the current user's
+Azure CLI (`az login`) session for the configured subscription and tenant.
+Azure CLI manages renewal of these tokens; they are not saved to the app's
+token cache. If Azure CLI is unavailable or cannot obtain a token, you will be
+prompted to sign in (device code by default, or browser if `--user-flow` is set).
 
 ## Usage
 
@@ -110,7 +114,7 @@ export AZURE_STORAGE_ACCOUNT=mystorageacct
 # Launch the interactive two-pane TUI
 ./blober tui --container mycontainer --local-path ./downloads
 
-# Force browser-based login on the next auth
+# Use browser login if cached and Azure CLI credentials are unavailable
 ./blober --user-flow blob list --container mycontainer
 ```
 
@@ -151,6 +155,41 @@ blober.exe blob upload  --container mycontainer --key uploads/report.pdf --file 
 blober.exe blob download --container mycontainer --key uploads/report.pdf --file report.pdf --force
 blober.exe tui --container mycontainer --local-path .\downloads
 ```
+
+## TUI navigation and saved connections
+
+| Key | Action |
+| --- | ------ |
+| `F2` | Rename the highlighted file or directory. |
+| `m` | Move selected items (or the highlighted item) to the other pane after confirmation. |
+| `g` | Enter a directory path or Azure prefix directly. |
+| `Ctrl+B` | Save the current pane's connection and directory as a named bookmark. |
+| `b` | Open the bookmark picker; Enter opens, Delete removes a bookmark. |
+| `1` | Open keyboard help; Up/Down or PageUp/PageDown scroll it. |
+
+Rename and move reject existing destinations, including when `--force` is set.
+Local, SFTP and WebDAV use native rename/move when possible. Other moves copy
+each complete source item before deleting it. A failed or cancelled transfer
+keeps that item's source, but earlier completed items stay moved and copied
+destination files may remain. Copy/delete moves do not preserve permissions or
+timestamps and reject symlinks and special files rather than changing their
+meaning. Empty directories are preserved where supported; moving a tree with
+empty directories to Azure or plain HTTP is rejected.
+
+The path prompt supports relative paths for Local/SFTP/HTTP/WebDAV and `~` for
+the local home directory. Azure prefixes are container-root-relative (`/` goes
+to the root). Web paths must stay within the connection's root URL; use `p` to
+connect elsewhere. Navigation failures leave the current directory unchanged.
+Text prompts support cursor editing, `Ctrl+U` to clear, and `Esc` to cancel.
+
+Bookmarks are saved explicitly in `blober/bookmarks.json` under the OS user
+configuration directory (`$XDG_CONFIG_HOME`, otherwise `~/.config` on Linux).
+The file is written atomically with owner-only permissions. Bookmarks contain
+connection parameters, an optional SSH key *path*, and the current directory or
+Azure container/prefix, never passwords, tokens or private-key contents.
+Credential-bearing URLs cannot be saved. Remote bookmarks reopen the provider
+form for review and password entry, then reconnect when you press Connect.
+Bookmark names must be unique; deleting a bookmark never deletes stored files.
 
 ## Library usage
 

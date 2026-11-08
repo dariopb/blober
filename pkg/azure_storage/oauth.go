@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/dariopb/blober/pkg/azure_storage/internal/oauth"
 	qrterminal "github.com/mdp/qrterminal/v3"
 )
@@ -49,6 +51,27 @@ func Login(ctx context.Context, cfg Config) (azcore.TokenCredential, error) {
 				return newRefreshableTokenCredential(ctx, cfg, http.DefaultClient, refreshed), nil
 			}
 		}
+	}
+
+	cliOptions := &azidentity.AzureCLICredentialOptions{
+		Subscription: cfg.SubscriptionID,
+	}
+	if cfg.TenantID != "common" && cfg.TenantID != "organizations" && cfg.TenantID != "consumers" {
+		cliOptions.TenantID = cfg.TenantID
+	}
+	scopes := make([]string, 0)
+	for _, scope := range strings.Fields(cfg.Scope) {
+		if scope != OfflineAccess {
+			scopes = append(scopes, scope)
+		}
+	}
+	if cred, err := azidentity.NewAzureCLICredential(cliOptions); err == nil {
+		if _, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: scopes}); err == nil {
+			return cred, nil
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	var token CachedToken

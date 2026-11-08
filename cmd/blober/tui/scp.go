@@ -73,6 +73,7 @@ type scpSession struct {
 	ssh       *ssh.Client
 	sftp      *sftp.Client
 	label     string
+	config    scpConfig
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -169,7 +170,15 @@ func connectSCP(cfg scpConfig) (*scpSession, string, error) {
 		}
 	}
 
-	return &scpSession{ssh: sshClient, sftp: sftpClient, label: cfg.label()}, root, nil
+	if info, err := sftpClient.Stat(root); err != nil || !info.IsDir() {
+		_ = sftpClient.Close()
+		_ = sshClient.Close()
+		if err != nil {
+			return nil, "", err
+		}
+		return nil, "", fmt.Errorf("not a directory: %s", root)
+	}
+	return &scpSession{ssh: sshClient, sftp: sftpClient, label: cfg.label(), config: cfg}, root, nil
 }
 
 func loadSigner(keyPath string) (ssh.Signer, error) {

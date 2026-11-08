@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +18,170 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/dariopb/blober/pkg/azure_storage/internal/oauth"
 )
+
+func TestLoginAzureCLI(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		tenant     string
+		output     string
+		exitCode   string
+		missingCLI bool
+		cached     bool
+		canceled   bool
+		wantDevice bool
+	}{
+		{name: "default tenant"},
+		{name: "explicit tenant", tenant: "11111111-1111-1111-1111-111111111111"},
+		{name: "cached token preferred", cached: true},
+		{name: "not logged in", exitCode: "1", wantDevice: true},
+		{name: "CLI unavailable", missingCLI: true, wantDevice: true},
+		{name: "invalid CLI response", output: "invalid JSON", wantDevice: true},
+		{name: "canceled", canceled: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.TokenFile = filepath.Join(t.TempDir(), "token.json")
+			if tt.tenant != "" {
+				cfg.TenantID = tt.tenant
+			}
+			output := tt.output
+			if output == "" {
+				body, err := json.Marshal(map[string]any{
+					"accessToken": "cli-access",
+					"expiresOn":   time.Now().Add(time.Hour).Format("2006-01-02 15:04:05.000000"),
+					"expires_on":  time.Now().Add(time.Hour).Unix(),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				output = string(body)
+			}
+			argsFile := fakeAzureCLI(t, output, tt.exitCode, tt.missingCLI)
+			if tt.cached {
+				if err := saveCachedToken(cfg.TokenFile, CachedToken{
+					AccessToken: "cached-access",
+					ExpiresOn:   time.Now().Add(time.Hour).Unix(),
+					TenantID:    cfg.TenantID,
+					ClientID:    cfg.ClientID,
+					Scope:       cfg.Scope,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prompted := false
+			cfg.Prompt = func(AuthPrompt) { prompted = true }
+			deviceRequested := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				deviceRequested = true
+				if r.URL.Path != "/"+cfg.TenantID+"/oauth2/v2.0/devicecode" {
+					t.Errorf("unexpected identity request: %s", r.URL.Path)
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"device_fallback"}`))
+			}))
+			defer server.Close()
+			defer setIdentityBaseURL(t, server.URL)()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tt.canceled {
+				cancel()
+			}
+			cred, err := Login(ctx, cfg)
+			if tt.canceled {
+				if !errors.Is(err, context.Canceled) || deviceRequested {
+					t.Fatalf("err = %v, device requested = %v", err, deviceRequested)
+				}
+				return
+			}
+			if tt.wantDevice {
+				var oauthErr oauth.ErrorResponse
+				if !errors.As(err, &oauthErr) || oauthErr.ErrorCode != "device_fallback" || !deviceRequested {
+					t.Fatalf("err = %v, device requested = %v", err, deviceRequested)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			token, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{StorageScope}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "cli-access"
+			if tt.cached {
+				want = "cached-access"
+			}
+			if token.Token != want || deviceRequested || prompted {
+				t.Fatalf("token = %q, device requested = %v, prompted = %v", token.Token, deviceRequested, prompted)
+			}
+			args, err := os.ReadFile(argsFile)
+			if tt.cached {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("cached login invoked Azure CLI: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"account\nget-access-token\n", "--resource\nhttps://storage.azure.com\n", "--subscription\n" + cfg.SubscriptionID + "\n"} {
+				if !strings.Contains(string(args), want) {
+					t.Errorf("CLI args %q missing %q", args, want)
+				}
+			}
+			if tt.tenant != "" {
+				if !strings.Contains(string(args), "--tenant\n"+tt.tenant+"\n") {
+					t.Errorf("CLI args missing tenant: %q", args)
+				}
+			} else if strings.Contains(string(args), "--tenant") {
+				t.Errorf("default login should use the CLI tenant: %q", args)
+			}
+			if _, err := os.Stat(cfg.TokenFile); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("CLI token should not be written to app cache: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoginAzureCLIFallsBackToBrowser(t *testing.T) {
+	fakeAzureCLI(t, "", "1", false)
+	cfg := testConfig(t)
+	cfg.TokenFile = filepath.Join(t.TempDir(), "token.json")
+	cfg.UserFlow = true
+	cfg.Prompt = func(AuthPrompt) {}
+	wantErr := errors.New("browser opened")
+	oldOpen := openBrowserFunc
+	openBrowserFunc = func(string) error { return wantErr }
+	defer func() { openBrowserFunc = oldOpen }()
+
+	if _, err := Login(context.Background(), cfg); !errors.Is(err, wantErr) {
+		t.Fatalf("Login error = %v, want browser fallback", err)
+	}
+}
+
+func fakeAzureCLI(t *testing.T, output, exitCode string, missing bool) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake Azure CLI uses a POSIX shell")
+	}
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args")
+	t.Setenv("PATH", dir)
+	t.Setenv("BLOBER_TEST_AZ_ARGS", argsFile)
+	t.Setenv("BLOBER_TEST_AZ_OUTPUT", output)
+	if exitCode == "" {
+		exitCode = "0"
+	}
+	t.Setenv("BLOBER_TEST_AZ_EXIT", exitCode)
+	if !missing {
+		script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BLOBER_TEST_AZ_ARGS\"\nprintf '%s\\n' \"$BLOBER_TEST_AZ_OUTPUT\"\nexit \"$BLOBER_TEST_AZ_EXIT\"\n"
+		if err := os.WriteFile(filepath.Join(dir, "az"), []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return argsFile
+}
 
 func TestRefreshCachedToken(t *testing.T) {
 	cfg := testConfig(t)
